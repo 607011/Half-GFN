@@ -1,0 +1,15 @@
+# Compiled binaries
+/hgfn_sieve
+/prp_test
+
+# Runtime artifacts
+*.ckpt
+*.done
+prove_work/
+pfgw_work/
+
+# Output files
+kand*.txt
+kandidaten.txt
+prp.txt
+primes.txt
