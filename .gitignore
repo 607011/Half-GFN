@@ -1,4 +1,7 @@
-# Compiled binaries
+# CMake build directory
+build/
+
+# Compiled binaries (in-tree fallback)
 /hgfn_sieve
 /prp_test
 

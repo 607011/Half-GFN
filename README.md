@@ -68,21 +68,30 @@ On macOS with Homebrew:
 brew install gmp pari
 ```
 
-The `Makefile` locates GMP automatically via `brew --prefix gmp`.
+CMake locates GMP automatically via `pkg-config`.
 
 ---
 
 ## Build
 
+The project uses CMake with the Ninja generator:
+
 ```bash
-make
+cmake -G Ninja -B build
+ninja -C build
 ```
 
-This builds `hgfn_sieve` and `prp_test`. `prove.sh` is a shell script and needs no
-compilation. `make clean` removes the binaries.
+The binaries land in `build/` (`build/hgfn_sieve`, `build/prp_test`). `prove.sh` is
+a shell script and needs no compilation. `cmake --install build` installs the tools
+(prefix via `-DCMAKE_INSTALL_PREFIX=...`).
 
-> Note: the `Makefile` uses `-march=native` for maximum speed, which ties the
-> binaries to this machine's CPU. Drop that flag if you want to distribute them.
+CMake finds GMP through `pkg-config` (with a manual search as fallback; set the
+`GMP_DIR` environment variable to point at a custom prefix). PARI/GP is only needed
+at runtime by `prove.sh`.
+
+> Note: `-march=native` is enabled by default for maximum speed, which ties the
+> binaries to this machine's CPU. Configure with `-DHGFN_NATIVE=OFF` for portable
+> binaries.
 
 ---
 
@@ -274,4 +283,4 @@ primes.txt
 | `prove.sh` | primality proof driver (PARI/GP, journaling) |
 | `hgfn_sieve.py` | the original Python reference implementation of the sieve |
 | `run_pfgw.sh` | legacy PFGW-based PRP wrapper (x86) |
-| `Makefile` | builds `hgfn_sieve` and `prp_test` |
+| `CMakeLists.txt` | CMake build (Ninja generator) for `hgfn_sieve` and `prp_test` |
