@@ -9,24 +9,36 @@ folder holds the actual numbers those records point to.
 
 ```
 results/
-  primes.tsv              # proven primes (the crown jewels)
-  prp/k<K>/<start>-<end>.txt   # PRP survivors per block (inputs to the proof stage)
+  primes.tsv                      # one SUMMARY row per proven block
+  primes/k<K>/<start>-<end>.txt    # proven prime bases of that block
+  prp/k<K>/<start>-<end>.txt       # PRP survivors of that block
 ```
 
-## `primes.tsv`
+Per-block lists scale: small `k` yields many primes (thousands per block), large `k`
+very few. One row per prime would bloat a single file, so the actual bases live in
+per-block files and `primes.tsv` only summarizes.
 
-Tab-separated, append-only. One row per proven prime M(b) = (b^N+1)/2, N = 2^k:
+## `primes.tsv` (summary)
+
+Tab-separated, append-only. One row per proven block:
 
 ```
-# date   k   base   digits   method   commit   host
+# date   k   block_start   block_end   n_primes   max_digits   method   commit   host
 ```
 
-- `method`: `aprcl` or `ecpp` (from `prove.sh`).
-- `commit`: git short hash of the tools used, for reproducibility.
+- `n_primes`: how many b in the block give a proven prime M(b) = (b^N+1)/2, N = 2^k.
+- `max_digits`: decimal digits of the largest proven M(b) in the block.
+- `method`: `aprcl` or `ecpp`; `commit`: git short hash of the tools used.
 
-## `prp/k<K>/<start>-<end>.txt`
+## `primes/k<K>/<start>-<end>.txt` and `prp/k<K>/<start>-<end>.txt`
 
-The PRP survivors of one 1,000,000-base block (same format as a candidate file:
-a `# (b^N+1)/2, ...` header then one base per line). These are the exact inputs the
-proof stage consumes; keeping them means the expensive sieve+PRP work is not lost and
-the proof queue (`./coverage.sh todo`) is directly actionable.
+Proven prime bases (resp. PRP survivors) of one 1,000,000-base block: a `#` header
+then one base `b` per line.
+
+`prp/` is a **staging area — the proof queue**: it holds the PRP survivors only for
+blocks whose proof is still pending (so the expensive sieve+PRP work is not lost and
+`./coverage.sh todo` is directly actionable). **Once a block is proved, delete its
+`prp/` file** — the verified result lives in `primes/`, and `coverage.tsv` keeps the
+PRP count for provenance. (If a block ever has pseudoprimes, i.e. `n_prp > n_primes`,
+those `prp \ primes` bases are the only thing lost on deletion; record them separately
+first if you care — so far every block has had zero.)

@@ -1,1 +1,2 @@
-# date	k	base	digits	method	commit	host
+# date	k	block_start	block_end	n_primes	max_digits	method	commit	host
+2026-10-01	4	0	1000000	17846	96	aprcl	9a20105	Ollis-Mac-mini-M2-Pro-5

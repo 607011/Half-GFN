@@ -2,3 +2,6 @@
 2026-10-01	15	0	1000000	sieve	plimit=1e9	157063	ac55dfd	Ollis-Mac-mini-M2-Pro-5
 2026-10-01	8	0	1000000	sieve	plimit=1e7	258933	ac55dfd	Ollis-Mac-mini-M2-Pro-5
 2026-10-01	8	0	1000000	prp	bases=3,5,7	2188	ac55dfd	Ollis-Mac-mini-M2-Pro-5
+2026-10-01	4	0	1000000	sieve	plimit=1e7	128092	9a20105	Ollis-Mac-mini-M2-Pro-5
+2026-10-01	4	0	1000000	prp	bases=3,5,7	17846	9a20105	Ollis-Mac-mini-M2-Pro-5
+2026-10-01	4	0	1000000	proof	method=aprcl	17846	9a20105	Ollis-Mac-mini-M2-Pro-5
