@@ -1,0 +1,5 @@
+# proven primes: b with (b^256+1)/2 prime (aprcl), block [0,1000)
+331
+507
+665
+819

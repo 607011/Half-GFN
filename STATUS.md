@@ -51,11 +51,49 @@ _Do not edit by hand -- run `./coverage.sh status`._
 | 15000000–16000000 | plimit=1e7 (125775) | bases=3,5,7 (6843) | method=aprcl (6843) |
 | 16000000–17000000 | plimit=1e7 (125727) | bases=3,5,7 (6845) | method=aprcl (6845) |
 
+## k = 6
+
+| block (bases) | sieve | PRP | proof |
+|---|---|---|---|
+| 0–20000 | plimit=1e7 (2796) | bases=3,5,7 (155) | method=aprcl (155) |
+
+## k = 7
+
+| block (bases) | sieve | PRP | proof |
+|---|---|---|---|
+| 0–5000 | plimit=1e7 (556) | bases=3,5,7 (15) | method=aprcl (15) |
+
 ## k = 8
 
 | block (bases) | sieve | PRP | proof |
 |---|---|---|---|
-| 0–1000000 | plimit=1e7 (258933) | bases=3,5,7 (2188) | — |
+| 0–1000 | plimit=1e7 (247) | bases=3,5,7 (4) | method=aprcl (4) |
+
+## k = 9
+
+| block (bases) | sieve | PRP | proof |
+|---|---|---|---|
+| 0–200 | plimit=1e7 (56) | bases=3,5,7 (0) | method=aprcl (0) |
+| 200–400 | plimit=1e7 (51) | bases=3,5,7 (0) | method=aprcl (0) |
+| 400–600 | plimit=1e7 (59) | bases=3,5,7 (1) | method=aprcl (1) |
+| 600–800 | plimit=1e7 (59) | bases=3,5,7 (0) | method=aprcl (0) |
+| 800–1000 | plimit=1e7 (56) | bases=3,5,7 (0) | method=aprcl (0) |
+| 1000–1200 | plimit=1e7 (51) | bases=3,5,7 (0) | method=aprcl (0) |
+| 1200–1400 | plimit=1e7 (52) | bases=3,5,7 (0) | method=aprcl (0) |
+| 1400–1600 | plimit=1e7 (50) | bases=3,5,7 (0) | method=aprcl (0) |
+| 1600–1800 | plimit=1e7 (52) | bases=3,5,7 (0) | method=aprcl (0) |
+| 1800–2000 | plimit=1e7 (42) | bases=3,5,7 (1) | method=aprcl (1) |
+| 2000–2200 | plimit=1e7 (42) | bases=3,5,7 (0) | method=aprcl (0) |
+| 2200–2400 | plimit=1e7 (53) | bases=3,5,7 (1) | method=aprcl (1) |
+| 2400–2600 | plimit=1e7 (51) | bases=3,5,7 (0) | method=aprcl (0) |
+| 2600–2800 | plimit=1e7 (54) | bases=3,5,7 (0) | method=aprcl (0) |
+| 2800–3000 | plimit=1e7 (48) | bases=3,5,7 (0) | method=aprcl (0) |
+
+## k = 10
+
+| block (bases) | sieve | PRP | proof |
+|---|---|---|---|
+| 0–1000000 | plimit=1e11 (177115) | — | — |
 
 ## k = 15
 
