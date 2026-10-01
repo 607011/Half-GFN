@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 #
-# run_pfgw.sh  --  PRP-/Primzahltest der Sieb-Ueberlebenden mit pfgw (OpenPFGW)
+# run_pfgw.sh  --  PRP/primality test of the sieve survivors with pfgw (OpenPFGW)
 #
-# Zweiter Schritt des Solo-Workflows: Das C++-Sieb (hgfn_sieve) liefert eine
-# Kandidatenliste von Basen b, deren M(b) = (b^N + 1)/2 keinen kleinen Faktor
-# hat. Dieses Skript testet jede davon mit pfgw auf (probable) Primalitaet.
+# Second step of the solo workflow: the C++ sieve (hgfn_sieve) produces a list
+# of candidate bases b whose M(b) = (b^N + 1)/2 has no small factor. This script
+# tests each of them with pfgw for (probable) primality.
 #
-# Der Exponent N = 2^k wird automatisch aus der Header-Zeile der
-# Kandidatendatei gelesen (z. B. "# (b^32768+1)/2, gesiebt bis p = ...").
+# The exponent N = 2^k is read automatically from the candidate file's header
+# line (e.g. "# (b^32768+1)/2, sieved up to p = ...").
 #
-# Aufruf:
-#   ./run_pfgw.sh [Optionen] [kandidatendatei]      (Default: kand.txt)
+# Usage:
+#   ./run_pfgw.sh [options] [candidate-file]        (default: kand.txt)
 #
-# Optionen:
-#   --pfgw PATH     Pfad/Name des pfgw-Binaries (sonst Autoerkennung)
-#   --exp E         Exponent N ueberschreiben (sonst aus Header)
-#   --prp-base B    Fermat-PRP-Basis (pfgw -b<B>); ohne Angabe pfgw-Default
-#   --limit N       nur die ersten N Basen testen (0 = alle, Default 0)
-#   --out FILE      gefundene (P)PRP-Basen hierhin (Default prp.txt)
-#   --extra "..."   zusaetzliche pfgw-Flags (z. B. "-tc" fuer N-1/N+1-Beweis)
-#   -h | --help     diese Hilfe
+# Options:
+#   --pfgw PATH     path/name of the pfgw binary (otherwise auto-detected)
+#   --exp E         override the exponent N (otherwise from the header)
+#   --prp-base B    Fermat PRP base (pfgw -b<B>); without it, the pfgw default
+#   --limit N       test only the first N bases (0 = all, default 0)
+#   --out FILE      write the found (P)PRP bases here (default prp.txt)
+#   --extra "..."   extra pfgw flags (e.g. "-tc" for an N-1/N+1 proof)
+#   -h | --help     this help
 #
-# Beispiel:
+# Example:
 #   ./hgfn_sieve --k 15 --bmax 1000001 --plimit 1e9 --out kand.txt
 #   ./run_pfgw.sh --limit 50 kand.txt
 #
 set -euo pipefail
 
 # --------------------------------------------------------------------------
-# Argumente
+# Arguments
 # --------------------------------------------------------------------------
 CANDFILE=""
 PFGW=""
@@ -49,19 +49,19 @@ while [ $# -gt 0 ]; do
         --out)      OUT="$2"; shift 2 ;;
         --extra)    EXTRA="$2"; shift 2 ;;
         -h|--help)  usage 0 ;;
-        -*)         echo "Unbekannte Option: $1" >&2; usage 2 ;;
+        -*)         echo "Unknown option: $1" >&2; usage 2 ;;
         *)          CANDFILE="$1"; shift ;;
     esac
 done
 [ -z "$CANDFILE" ] && CANDFILE="kand.txt"
 
 if [ ! -f "$CANDFILE" ]; then
-    echo "Kandidatendatei nicht gefunden: $CANDFILE" >&2
+    echo "Candidate file not found: $CANDFILE" >&2
     exit 1
 fi
 
 # --------------------------------------------------------------------------
-# pfgw finden
+# Find pfgw
 # --------------------------------------------------------------------------
 if [ -z "$PFGW" ]; then
     for cand in pfgw64 pfgw pfgw-x86_64 ./pfgw64 ./pfgw; do
@@ -70,47 +70,47 @@ if [ -z "$PFGW" ]; then
 fi
 if [ -z "$PFGW" ] || ! command -v "$PFGW" >/dev/null 2>&1; then
     cat >&2 <<'EOF'
-pfgw wurde nicht gefunden.
+pfgw was not found.
 
-  OpenPFGW gibt es als Binary bei:  https://sourceforge.net/projects/openpfgw/
-  Danach entweder ins PATH legen oder mit --pfgw /pfad/zu/pfgw64 angeben.
-  (Auf Apple Silicon laeuft der x86_64-Build unter Rosetta 2.)
+  OpenPFGW is available as a binary at:  https://sourceforge.net/projects/openpfgw/
+  Then put it on your PATH or pass it with --pfgw /path/to/pfgw64.
+  (On Apple Silicon the x86_64 build runs under Rosetta 2.)
 EOF
     exit 127
 fi
 
 # --------------------------------------------------------------------------
-# Exponent bestimmen (aus Header:  "# (b^EXP+1)/2, ...")
+# Determine the exponent (from the header:  "# (b^EXP+1)/2, ...")
 # --------------------------------------------------------------------------
 if [ -z "$EXP" ]; then
     EXP=$(sed -nE '1 s/.*b\^([0-9]+).*/\1/p' "$CANDFILE" || true)
 fi
 if ! [[ "$EXP" =~ ^[0-9]+$ ]]; then
-    echo "Exponent nicht aus Header lesbar -- bitte mit --exp N angeben." >&2
+    echo "Exponent not readable from header -- please pass --exp N." >&2
     exit 1
 fi
 
 # --------------------------------------------------------------------------
-# Ausdrucksdatei bauen:  je Zeile  (b^EXP+1)/2
+# Build the expression file:  one (b^EXP+1)/2 per line
 # --------------------------------------------------------------------------
 WORK="pfgw_work"
 mkdir -p "$WORK"
 EXPRFILE="$WORK/expr.txt"
 LOGFILE="$WORK/pfgw.log"
 
-# Nur Zahlen-Zeilen (Kommentare wie '# ...' ueberspringen), optional gekappt.
+# Number lines only (skip comments like '# ...'), optionally capped.
 awk -v ex="$EXP" -v lim="$LIMIT" '
     /^[0-9]+/ { c++; if (lim>0 && c>lim) exit; printf "(%s^%s+1)/2\n", $1, ex }
 ' "$CANDFILE" > "$EXPRFILE"
 
 NCAND=$(wc -l < "$EXPRFILE" | tr -d ' ')
 if [ "$NCAND" -eq 0 ]; then
-    echo "Keine Kandidaten in $CANDFILE gefunden." >&2
+    echo "No candidates found in $CANDFILE." >&2
     exit 1
 fi
 
 # --------------------------------------------------------------------------
-# pfgw-Flags zusammenstellen
+# Assemble the pfgw flags
 # --------------------------------------------------------------------------
 PFGW_FLAGS=()
 [ -n "$PRPBASE" ] && PFGW_FLAGS+=("-b${PRPBASE}")
@@ -119,17 +119,17 @@ PFGW_FLAGS=()
 PFGW_FLAGS+=("$EXPRFILE")
 
 echo "pfgw:        $PFGW"
-echo "Exponent N:  $EXP   (M(b) = (b^N+1)/2)"
-echo "Kandidaten:  $NCAND aus $CANDFILE${LIMIT:+ }$( [ "$LIMIT" -gt 0 ] && echo "(auf $LIMIT begrenzt)")"
-echo "Ergebnis ->  $OUT   (Roh-Log: $LOGFILE)"
-echo "Flags:       ${PFGW_FLAGS[*]}"
+echo "exponent N:  $EXP   (M(b) = (b^N+1)/2)"
+echo "candidates:  $NCAND from $CANDFILE${LIMIT:+ }$( [ "$LIMIT" -gt 0 ] && echo "(capped at $LIMIT)")"
+echo "result ->    $OUT   (raw log: $LOGFILE)"
+echo "flags:       ${PFGW_FLAGS[*]}"
 echo "--------------------------------------------------------------------------"
 
 : > "$OUT"
 found=0
 
-# pfgw ausfuehren; Ergebnis-Zeilen live auswerten und PRP/Prime-Basen sammeln.
-# Rueckgabecode von pfgw ueber PIPESTATUS pruefen.
+# Run pfgw; evaluate result lines live and collect PRP/prime bases.
+# Check pfgw's return code via PIPESTATUS.
 set +e
 "$PFGW" "${PFGW_FLAGS[@]}" 2>&1 | tee "$LOGFILE" | while IFS= read -r line; do
     printf '%s\n' "$line"
@@ -146,15 +146,15 @@ done
 rc=${PIPESTATUS[0]}
 set -e
 
-# Basen numerisch sortieren/deduplizieren
+# Sort/deduplicate the bases numerically
 if [ -s "$OUT" ]; then
     sort -n -u "$OUT" -o "$OUT"
 fi
 NFOUND=$(grep -c '^[0-9]' "$OUT" 2>/dev/null || echo 0)
 
 echo "--------------------------------------------------------------------------"
-echo "Fertig. $NFOUND (probable) Primzahl(en) gefunden -> $OUT"
+echo "Done. $NFOUND (probable) prime(s) found -> $OUT"
 if [ "$rc" -ne 0 ]; then
-    echo "Hinweis: pfgw endete mit Code $rc (siehe $LOGFILE)." >&2
+    echo "Note: pfgw exited with code $rc (see $LOGFILE)." >&2
 fi
 exit "$rc"

@@ -13,6 +13,9 @@ pfgw_work/
 
 # Output files
 kand*.txt
-kandidaten.txt
+candidates.txt
 prp.txt
 primes.txt
+
+# Persistent proof journals (intra-block checkpoints)
+.proofwork/

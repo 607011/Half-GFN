@@ -1,26 +1,26 @@
 // hgfn_sieve.cpp
 //
-// Sieb fuer halbierte verallgemeinerte Fermat-Zahlen  M(b) = (b^N + 1) / 2
-// mit N = 2^k und ungerader Basis b in [bmin, bmax].
+// Sieve for halved generalized Fermat numbers  M(b) = (b^N + 1) / 2
+// with N = 2^k and odd base b in [bmin, bmax].
 //
-// C++-Portierung von hgfn_sieve.py, optimiert auf Durchsatz:
-//   * mulmod/powmod ueber __int128 (kein Overflow bis p ~ 1.8e19)
-//   * nur ungerade Basen im Bit-... aeh Byte-Array (Index i <-> b = b0 + 2i)
-//   * Multithreading ueber die Siebprimzahlen (std::thread, kein OpenMP noetig)
+// C++ port of ___attic/hgfn_sieve.py, tuned for throughput:
+//   * mulmod/powmod via __int128 (no overflow up to p ~ 1.8e19)
+//   * odd bases only in a byte array (index i <-> b = b0 + 2i)
+//   * multithreaded over the sieve primes (std::thread, no OpenMP needed)
 //
-// Mathematischer Kern (siehe Python-Original):
-//   Ist p ein ungerader Primteiler von b^N + 1, dann hat b mod p die Ordnung
-//   2N, also p = 1 (mod 2N). Es genuegt, Primzahlen p = 2N*j + 1 zu betrachten.
-//   x^N = -1 (mod p) hat genau N Loesungen: die ungeraden Potenzen einer
-//   primitiven 2N-ten Einheitswurzel r. Jede Basis b, die zu einer davon
-//   kongruent ist, hat den Faktor p und wird gestrichen.
+// Mathematical core (see the Python original in ___attic/):
+//   If p is an odd prime divisor of b^N + 1, then b has order 2N modulo p,
+//   so p = 1 (mod 2N). It is enough to consider primes p = 2N*j + 1.
+//   x^N = -1 (mod p) has exactly N solutions: the odd powers of a primitive
+//   2N-th root of unity r. Every base b congruent to one of them has the
+//   factor p and is struck out.
 //
-// Aufruf (Beispiel):
+// Example:
 //   ./hgfn_sieve --k 15 --bmin 3 --bmax 1000001 --plimit 1e9 --out kand.txt
 //
-// Kompilieren:
-//   clang++ -O3 -std=c++17 -pthread hgfn_sieve.cpp -o hgfn_sieve
-//   (oder: make)
+// Build:
+//   cmake -G Ninja -B build && ninja -C build
+//   (or directly: clang++ -O3 -std=c++17 -pthread hgfn_sieve.cpp -o hgfn_sieve)
 
 #include <cstdint>
 #include <cstdio>
@@ -37,14 +37,14 @@
 using u64 = uint64_t;
 using u128 = unsigned __int128;
 
-// Wird vom SIGINT/SIGTERM-Handler gesetzt: naechster Blockrand -> Checkpoint + Ende.
+// Set by the SIGINT/SIGTERM handler: next block boundary -> checkpoint + exit.
 static volatile std::sig_atomic_t g_stop = 0;
 static void on_signal(int) {
     g_stop = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Modulare Arithmetik
+// Modular arithmetic
 // ---------------------------------------------------------------------------
 static inline u64 mulmod(u64 a, u64 b, u64 m) {
     return (u64)((u128)a * b % m);
@@ -64,7 +64,7 @@ static inline u64 powmod(u64 a, u64 e, u64 m) {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministischer Miller-Rabin (korrekt fuer alle 64-Bit-n)
+// Deterministic Miller-Rabin (correct for all 64-bit n)
 // ---------------------------------------------------------------------------
 static const u64 MR_BASES[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
 
@@ -104,7 +104,7 @@ static bool is_prime(u64 n) {
 }
 
 // ---------------------------------------------------------------------------
-// Primitive 2N-te Einheitswurzel: r mit r^N = -1 (mod p)
+// Primitive 2N-th root of unity: r with r^N = -1 (mod p)
 // ---------------------------------------------------------------------------
 static u64 primitive_2N_root(u64 p, u64 N) {
     u64 e = (p - 1) / (2 * N);
@@ -117,12 +117,12 @@ static u64 primitive_2N_root(u64 p, u64 N) {
 }
 
 // ---------------------------------------------------------------------------
-// Algebraisch zusammengesetzte Basen vorab streichen:  b = c^e (e >= 3 ungerade)
-// Dann ist b^N + 1 durch c^N + 1 teilbar. Overflow-sicher via __int128.
+// Strike algebraically composite bases up front:  b = c^e (e >= 3 odd).
+// Then b^N + 1 is divisible by c^N + 1. Overflow-safe via __int128.
 // ---------------------------------------------------------------------------
 static void strike_odd_powers(std::vector<uint8_t>& alive, int64_t b0, int64_t bmax) {
     for (int e = 3; ; e += 2) {
-        // 3^e <= bmax ?  (overflow-sicher)
+        // 3^e <= bmax ?  (overflow-safe)
         u128 t = 1;
         bool too_big = false;
         for (int i = 0; i < e; ++i) {
@@ -158,8 +158,8 @@ static void strike_odd_powers(std::vector<uint8_t>& alive, int64_t b0, int64_t b
 }
 
 // ---------------------------------------------------------------------------
-// Streicht fuer eine einzelne Siebprimzahl p alle betroffenen Basen.
-// (Schreibt nur 0-Werte -> nebenlaeufig unkritisch: idempotent.)
+// Strike every affected base for a single sieve prime p.
+// (Writes 0 only -> benign under concurrency: idempotent.)
 // ---------------------------------------------------------------------------
 static void strike_prime(uint8_t* alive, size_t count, u64 p, u64 N, int64_t b0) {
     u64 r  = primitive_2N_root(p, N);
@@ -167,10 +167,10 @@ static void strike_prime(uint8_t* alive, size_t count, u64 p, u64 N, int64_t b0)
     u64 x  = r;
     const int64_t twop = (int64_t)(2 * p);
     for (u64 i = 0; i < N; ++i) {
-        // b muss ungerade sein -> Restklasse modulo 2p festlegen
+        // b must be odd -> pin the residue class modulo 2p
         int64_t y = (x & 1) ? (int64_t)x : (int64_t)(x + p);
         int64_t off = ((y - b0) % twop + twop) % twop;
-        int64_t first = b0 + off;              // kleinstes b >= b0 mit b = y (mod 2p)
+        int64_t first = b0 + off;              // smallest b >= b0 with b = y (mod 2p)
         size_t idx = (size_t)((first - b0) / 2);
         for (; idx < count; idx += p) {
             alive[idx] = 0;
@@ -180,10 +180,10 @@ static void strike_prime(uint8_t* alive, size_t count, u64 p, u64 N, int64_t b0)
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint: Parameter + Fortschritt (next_j) + das komplette alive-Array.
-// Format (little-endian, gleiche Maschine):
+// Checkpoint: parameters + progress (next_j) + the full alive array.
+// Format (little-endian, same machine):
 //   magic[8]="HGFNCK01", int k, int64 bmin, int64 bmax,
-//   u64 count, u64 next_j, u64 primes_used, dann count Bytes alive.
+//   u64 count, u64 next_j, u64 primes_used, then count bytes of alive.
 // ---------------------------------------------------------------------------
 static const char CKPT_MAGIC[8] = {'H', 'G', 'F', 'N', 'C', 'K', '0', '1'};
 
@@ -193,7 +193,7 @@ static bool save_checkpoint(const std::string& path, int k, int64_t bmin,
     std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) {
-        fprintf(stderr, "  [Warnung: Checkpoint %s nicht schreibbar]\n", tmp.c_str());
+        fprintf(stderr, "  [warning: checkpoint %s not writable]\n", tmp.c_str());
         return false;
     }
     u64 count = alive.size();
@@ -206,29 +206,29 @@ static bool save_checkpoint(const std::string& path, int k, int64_t bmin,
     ok = ok && fwrite(&next_j, sizeof(next_j), 1, f) == 1;
     ok = ok && fwrite(&primes_used, sizeof(primes_used), 1, f) == 1;
     ok = ok && fwrite(alive.data(), 1, count, f) == count;
-    // Auf Platte zwingen, dann atomar umbenennen.
+    // Force to disk, then rename atomically.
     ok = ok && fflush(f) == 0;
     fclose(f);
     if (!ok) {
-        fprintf(stderr, "  [Warnung: Checkpoint-Schreiben fehlgeschlagen]\n");
+        fprintf(stderr, "  [warning: checkpoint write failed]\n");
         remove(tmp.c_str());
         return false;
     }
     if (rename(tmp.c_str(), path.c_str()) != 0) {
-        fprintf(stderr, "  [Warnung: Checkpoint-Rename fehlgeschlagen]\n");
+        fprintf(stderr, "  [warning: checkpoint rename failed]\n");
         return false;
     }
     return true;
 }
 
-// Laedt Checkpoint, wenn vorhanden UND Parameter passen. Bei Nichtpassung:
-// Fehlermeldung + exit (um einen fremden Checkpoint nicht zu ueberschreiben).
+// Load a checkpoint if present AND the parameters match. On mismatch:
+// error message + exit (so we never overwrite someone else's checkpoint).
 static bool load_checkpoint(const std::string& path, int k, int64_t bmin,
                             int64_t bmax, std::vector<uint8_t>& alive,
                             u64& next_j, u64& primes_used) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) {
-        return false;   // kein Checkpoint -> frisch starten
+        return false;   // no checkpoint -> start fresh
     }
     char magic[8];
     int fk = 0;
@@ -245,16 +245,16 @@ static bool load_checkpoint(const std::string& path, int k, int64_t bmin,
     ok = ok && fread(&fprimes, sizeof(fprimes), 1, f) == 1;
     if (!ok) {
         fclose(f);
-        fprintf(stderr, "Checkpoint %s ist beschaedigt -- Abbruch.\n", path.c_str());
+        fprintf(stderr, "Checkpoint %s is corrupt -- aborting.\n", path.c_str());
         exit(1);
     }
     if (fk != k || fbmin != bmin || fbmax != bmax || fcount != alive.size()) {
         fclose(f);
         fprintf(stderr,
-                "Checkpoint %s passt nicht zu diesem Aufruf.\n"
-                "  Checkpoint: k=%d bmin=%lld bmax=%lld count=%llu\n"
-                "  Aufruf:     k=%d bmin=%lld bmax=%lld count=%llu\n"
-                "Anderen --checkpoint-Namen waehlen oder Datei loeschen.\n",
+                "Checkpoint %s does not match this invocation.\n"
+                "  checkpoint: k=%d bmin=%lld bmax=%lld count=%llu\n"
+                "  invocation: k=%d bmin=%lld bmax=%lld count=%llu\n"
+                "Choose a different --checkpoint name or delete the file.\n",
                 path.c_str(), fk, (long long)fbmin, (long long)fbmax,
                 (unsigned long long)fcount, k, (long long)bmin, (long long)bmax,
                 (unsigned long long)alive.size());
@@ -262,7 +262,7 @@ static bool load_checkpoint(const std::string& path, int k, int64_t bmin,
     }
     if (fread(alive.data(), 1, fcount, f) != fcount) {
         fclose(f);
-        fprintf(stderr, "Checkpoint %s: alive-Array unvollstaendig -- Abbruch.\n", path.c_str());
+        fprintf(stderr, "Checkpoint %s: alive array incomplete -- aborting.\n", path.c_str());
         exit(1);
     }
     fclose(f);
@@ -272,7 +272,7 @@ static bool load_checkpoint(const std::string& path, int k, int64_t bmin,
 }
 
 // ---------------------------------------------------------------------------
-// Das eigentliche Sieb (multithreaded, blockweise, resumbar)
+// The sieve itself (multithreaded, block by block, resumable)
 // ---------------------------------------------------------------------------
 struct SieveResult {
     std::vector<int64_t> survivors;
@@ -292,7 +292,7 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
     size_t count = (size_t)((bmax - b0) / 2 + 1);
     std::vector<uint8_t> alive(count, 1);
 
-    // Kandidaten p = step*j + 1, j = 1 .. jmax
+    // Candidates p = step*j + 1, j = 1 .. jmax
     u64 jmax = (plimit >= 1) ? (plimit - 1) / step : 0;
     u64 next_j = 1;
     u64 primes_start = 0;
@@ -302,12 +302,12 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
         resumed = load_checkpoint(ckpt_path, k, bmin, bmax, alive, next_j, primes_start);
     }
     if (resumed) {
-        fprintf(stderr, "Checkpoint geladen: weiter ab j=%llu (p=%llu), "
-                        "bereits %llu Siebprimzahlen.\n",
+        fprintf(stderr, "Checkpoint loaded: resuming at j=%llu (p=%llu), "
+                        "%llu sieve primes already done.\n",
                 (unsigned long long)next_j, (unsigned long long)(step * next_j + 1),
                 (unsigned long long)primes_start);
     } else {
-        // Frischer Start: algebraisch zusammengesetzte Basen streichen.
+        // Fresh start: strike algebraically composite bases.
         strike_odd_powers(alive, b0, bmax);
     }
 
@@ -318,38 +318,38 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
     std::atomic<u64> primes_used{primes_start};
     uint8_t* alive_ptr = alive.data();
 
-    const u64 CHUNK = (u64)1 << 16;   // j-Kandidaten pro Block (Sync-/Stop-Granularitaet)
+    const u64 CHUNK = (u64)1 << 16;   // j-candidates per block (sync/stop granularity)
     bool interrupted = false;
 
     u64 j = next_j;
     while (j <= jmax) {
-        // Pause? (am Blockrand, analog zu Checkpoint/Stop) Ausgeloest durch die
-        // Existenz der Pause-Datei -- plattformuebergreifend und auch im
-        // Hintergrund nutzbar. Vor dem Warten sicherheitshalber ein Checkpoint.
+        // Pause? (at a block boundary, like checkpoint/stop) Triggered by the
+        // existence of the pause file -- cross-platform and usable in the
+        // background too. Write a checkpoint first, just in case.
         if (!pause_file.empty() && std::filesystem::exists(pause_file)) {
             if (!ckpt_path.empty()) {
                 if (save_checkpoint(ckpt_path, k, bmin, bmax, j, primes_used.load(), alive)) {
-                    fprintf(stderr, "  [Checkpoint vor Pause: next_j=%llu]\n",
+                    fprintf(stderr, "  [checkpoint before pause: next_j=%llu]\n",
                             (unsigned long long)j);
                 }
             }
-            fprintf(stderr, "Pausiert (Datei '%s' vorhanden) -- loeschen zum Fortsetzen.\n",
+            fprintf(stderr, "Paused (file '%s' present) -- remove it to resume.\n",
                     pause_file.c_str());
             fflush(stderr);
             while (std::filesystem::exists(pause_file) && !g_stop) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
             if (!g_stop) {
-                fprintf(stderr, "Fortgesetzt.\n");
+                fprintf(stderr, "Resumed.\n");
                 fflush(stderr);
             }
-            // Pausendauer nicht gegen Report-/Checkpoint-Intervalle zaehlen.
+            // Do not count the pause against the report/checkpoint intervals.
             auto resume_now = std::chrono::steady_clock::now();
             t_last_report = resume_now;
             t_last_ckpt = resume_now;
         }
 
-        if (g_stop) {   // Stop (ggf. waehrend der Pause) -> Schleife verlassen
+        if (g_stop) {   // stop (possibly during the pause) -> leave the loop
             break;
         }
 
@@ -378,14 +378,14 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
             th.join();
         }
 
-        j = chunk_end;   // alle j < chunk_end sind jetzt erledigt -> sauberer Rand
+        j = chunk_end;   // all j < chunk_end are done now -> clean boundary
 
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - t_start).count();
 
         if (std::chrono::duration<double>(now - t_last_report).count() >= report_every) {
             t_last_report = now;
-            fprintf(stderr, "p bis %16llu  Primzahlen: %10llu  Zeit: %6.0f s\n",
+            fprintf(stderr, "p up to %16llu  primes: %10llu  time: %6.0f s\n",
                     (unsigned long long)(step * (j - 1) + 1),
                     (unsigned long long)primes_used.load(), elapsed);
             fflush(stderr);
@@ -395,25 +395,25 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
             std::chrono::duration<double>(now - t_last_ckpt).count() >= ckpt_interval;
         if (!ckpt_path.empty() && (time_to_ckpt || g_stop)) {
             if (save_checkpoint(ckpt_path, k, bmin, bmax, j, primes_used.load(), alive)) {
-                fprintf(stderr, "  [Checkpoint gespeichert: next_j=%llu]\n",
+                fprintf(stderr, "  [checkpoint saved: next_j=%llu]\n",
                         (unsigned long long)j);
                 fflush(stderr);
             }
             t_last_ckpt = now;
         }
 
-        if (g_stop) {   // Stop nach vollendetem Block -> oben wird abgebrochen
+        if (g_stop) {   // stop after a completed block -> loop top breaks out
             continue;
         }
     }
 
     if (g_stop) {
         interrupted = true;
-        fprintf(stderr, "Abbruch angefordert -- ");
+        fprintf(stderr, "Stop requested -- ");
         if (ckpt_path.empty()) {
-            fprintf(stderr, "kein --checkpoint gesetzt, Fortschritt geht verloren.\n");
+            fprintf(stderr, "no --checkpoint set, progress is lost.\n");
         } else {
-            fprintf(stderr, "Checkpoint geschrieben, gleicher Aufruf setzt fort.\n");
+            fprintf(stderr, "checkpoint written, the same command resumes.\n");
         }
     }
 
@@ -433,13 +433,13 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
 }
 
 // ---------------------------------------------------------------------------
-// Kommandozeile
+// Command line
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     int k = -1;
     int64_t bmin = 3, bmax = -1;
     double plimit_d = 1e8;
-    std::string out = "kandidaten.txt";
+    std::string out = "candidates.txt";
     std::string ckpt_path;
     double ckpt_interval = 60.0;
     std::string pause_file;
@@ -452,7 +452,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto next = [&](const char* name) -> const char* {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Fehlender Wert fuer %s\n", name);
+                fprintf(stderr, "Missing value for %s\n", name);
                 exit(2);
             }
             return argv[++i];
@@ -476,22 +476,22 @@ int main(int argc, char** argv) {
         } else if (a == "--pause-file") {
             pause_file = next("--pause-file");
         } else if (a == "-h" || a == "--help") {
-            printf("Aufruf: %s --k K --bmax BMAX [--bmin 3] [--plimit 1e8] "
-                   "[--out kandidaten.txt] [--threads N]\n"
-                   "        [--checkpoint DATEI] [--checkpoint-interval SEK] [--pause-file DATEI]\n"
-                   "  Existiert die Checkpoint-Datei, wird automatisch fortgesetzt.\n"
-                   "  Strg-C schreibt am naechsten Blockrand einen Checkpoint und endet.\n"
-                   "  --pause-file: solange die Datei existiert, pausiert das Sieb am\n"
-                   "                Blockrand (loeschen zum Fortsetzen).\n",
+            printf("Usage: %s --k K --bmax BMAX [--bmin 3] [--plimit 1e8] "
+                   "[--out candidates.txt] [--threads N]\n"
+                   "       [--checkpoint FILE] [--checkpoint-interval SEC] [--pause-file FILE]\n"
+                   "  If the checkpoint file exists, the run resumes automatically.\n"
+                   "  Ctrl-C writes a checkpoint at the next block boundary and exits.\n"
+                   "  --pause-file: while the file exists, the sieve pauses at a block\n"
+                   "                boundary (remove it to resume).\n",
                    argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "Unbekanntes Argument: %s\n", a.c_str());
+            fprintf(stderr, "Unknown argument: %s\n", a.c_str());
             return 2;
         }
     }
     if (k < 0 || bmax < 0) {
-        fprintf(stderr, "Fehler: --k und --bmax sind erforderlich. (--help fuer Hilfe)\n");
+        fprintf(stderr, "Error: --k and --bmax are required. (--help for usage)\n");
         return 2;
     }
     if (nthreads < 1) {
@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
     }
     u64 plimit = (u64)plimit_d;
 
-    // Strg-C / kill sauber abfangen -> Checkpoint am naechsten Blockrand.
+    // Catch Ctrl-C / kill cleanly -> checkpoint at the next block boundary.
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -507,35 +507,35 @@ int main(int argc, char** argv) {
                             pause_file);
 
     if (res.interrupted) {
-        printf("\nAbgebrochen nach %.1f s (%llu Siebprimzahlen). "
-               "Keine Kandidatendatei geschrieben.\n",
+        printf("\nAborted after %.1f s (%llu sieve primes). "
+               "No candidate file written.\n",
                res.secs, (unsigned long long)res.primes_used);
         if (!ckpt_path.empty()) {
-            printf("Gleicher Aufruf setzt beim Checkpoint %s fort.\n", ckpt_path.c_str());
+            printf("The same command resumes from checkpoint %s.\n", ckpt_path.c_str());
         }
         return 130;
     }
 
     int64_t total = (bmax - bmin) / 2 + 1;
-    printf("\nN = 2^%d = %llu, Basen %lld..%lld  (%d Threads)\n",
+    printf("\nN = 2^%d = %llu, bases %lld..%lld  (%d threads)\n",
            k, (unsigned long long)((u64)1 << k), (long long)bmin, (long long)bmax, nthreads);
-    printf("%llu Siebprimzahlen bis %llu in %.1f s\n",
+    printf("%llu sieve primes up to %llu in %.1f s\n",
            (unsigned long long)res.primes_used, (unsigned long long)plimit, res.secs);
-    printf("%zu von ca. %lld ungeraden Basen ueberleben (%.2f %%)\n",
+    printf("%zu of ~%lld odd bases survive (%.2f %%)\n",
            res.survivors.size(), (long long)total,
            100.0 * res.survivors.size() / (total > 0 ? total : 1));
 
     FILE* f = fopen(out.c_str(), "w");
     if (!f) {
-        fprintf(stderr, "Kann %s nicht schreiben\n", out.c_str());
+        fprintf(stderr, "Cannot write %s\n", out.c_str());
         return 1;
     }
-    fprintf(f, "# (b^%llu+1)/2, gesiebt bis p = %llu\n",
+    fprintf(f, "# (b^%llu+1)/2, sieved up to p = %llu\n",
             (unsigned long long)((u64)1 << k), (unsigned long long)plimit);
     for (int64_t b : res.survivors) {
         fprintf(f, "%lld\n", (long long)b);
     }
     fclose(f);
-    printf("Kandidaten geschrieben nach %s\n", out.c_str());
+    printf("Candidates written to %s\n", out.c_str());
     return 0;
 }
