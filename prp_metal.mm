@@ -1,15 +1,17 @@
-// prp_metal.mm  --  GPU-beschleunigter Fermat-PRP-Test via Apple Metal (Regime A).
+// prp_metal.mm  --  GPU-beschleunigter starker PRP-Test (Miller-Rabin) via
+// Apple Metal (Regime A).
 //
 // Idee (siehe README): ein GPU-Thread pro Kandidat b. Die CPU (GMP) berechnet
 // M = (b^N+1)/2 und die Montgomery-Konstanten; die GPU rechnet nur das Teure:
-// a^(M-1) mod M (Fermat-PRP) mit Montgomery-Multiplikation in 32-Bit-Limbs.
+// den starken Miller-Rabin-Test zu Basis a mit Montgomery-Multiplikation in
+// 32-Bit-Limbs (Zerlegung M-1 = d*2^s, dann a^d und die Quadrierungen).
 //
 // Dies ist ein PROTOTYP fuer "viele mittelgrosse Kandidaten": die feste Limb-Zahl
 // NL wird zur Laufzeit aus dem groessten M bestimmt und in den Kernel-Quelltext
 // einkompiliert. Fuer sehr grosse k (zehntausende Stellen) ist stattdessen ein
 // FFT-basierter Ansatz noetig (vgl. genefer) -- hier bewusst nicht abgedeckt.
 //
-// Enthaelt zum fairen Vergleich denselben Fermat-Test auf der CPU (GMP,
+// Enthaelt zum fairen Vergleich denselben starken Test auf der CPU (GMP,
 // multithreaded) und prueft GPU- gegen CPU-Ergebnis auf Gleichheit.
 //
 // Build (nur macOS): siehe CMakeLists.txt (Target prp_metal), oder:
@@ -112,35 +114,67 @@ static void montmul(thread uint* out,
     }
 }
 
-kernel void fermat_prp(device const uint*  Ms       [[buffer(0)]],   // ncand * NL
-                       device const uint*  oneMonts [[buffer(1)]],   // ncand * NL  (R mod M)
-                       device const uint*  aMs      [[buffer(2)]],   // ncand * NL  (a*R mod M)
-                       device const uint*  n0s      [[buffer(3)]],   // ncand
-                       device uchar*       out      [[buffer(4)]],   // ncand
-                       constant uint&      ncand    [[buffer(5)]],
-                       constant uint&      offset   [[buffer(6)]],   // erster Kandidat dieses Blocks
-                       uint gid [[thread_position_in_grid]]) {
+// Gleichheit zweier NL-Limb-Zahlen.
+static bool bnequal(thread const uint* a, thread const uint* b) {
+    for (uint j = 0; j < NL; ++j) {
+        if (a[j] != b[j]) { return false; }
+    }
+    return true;
+}
+
+// Starker Miller-Rabin-Test zu mehreren Basen (via Montgomery). Ein Kandidat
+// gilt nur dann als PRP, wenn er ALLE Basen besteht; faellt er bei einer durch,
+// brechen wir sofort ab (die meisten Kandidaten sind zusammengesetzt und fallen
+// schon bei der ersten Basis -> die weiteren Basen kosten fast nichts).
+kernel void miller_rabin(device const uint*  Ms       [[buffer(0)]],   // ncand * NL
+                         device const uint*  oneMonts [[buffer(1)]],   // ncand * NL  (R mod M)
+                         device const uint*  aMs      [[buffer(2)]],   // nbases * ncand * NL  (a*R mod M)
+                         device const uint*  n0s      [[buffer(3)]],   // ncand
+                         device uchar*       out      [[buffer(4)]],   // ncand
+                         constant uint&      ncand    [[buffer(5)]],
+                         constant uint&      offset   [[buffer(6)]],   // erster Kandidat des Blocks
+                         constant uint&      nbases   [[buffer(7)]],
+                         uint gid [[thread_position_in_grid]]) {
     const uint cand = offset + gid;
     if (cand >= ncand) {
         return;
     }
     const uint base = cand * NL;
 
-    thread uint m[NL];
-    thread uint r[NL];
-    thread uint am[NL];
+    thread uint m[NL];     // Modulus M
+    thread uint om[NL];    // Montgomery-Form der 1   (= R mod M)
+    thread uint r[NL];     // laufender Wert, in Montgomery-Form
+    thread uint am[NL];    // Montgomery-Form der aktuellen Basis (= a*R mod M)
+    thread uint mm1[NL];   // Montgomery-Form von M-1 (= M - om)
     thread uint tmp[NL];
-    thread uint one[NL];
     for (uint j = 0; j < NL; ++j) {
         m[j]  = Ms[base + j];
-        r[j]  = oneMonts[base + j];   // Start: Montgomery-Form der 1 (= R mod M)
-        am[j] = aMs[base + j];
-        one[j] = 0u;
+        om[j] = oneMonts[base + j];
     }
-    one[0] = 1u;
     uint n0 = n0s[cand];
 
-    // Hoechstes gesetztes Bit von M bestimmen (= hoechstes Bit von E = M-1).
+    // mm1 = M - om : Montgomery-Form von M-1, denn (M-1)*R = -R (mod M).
+    {
+        ulong borrow = 0;
+        for (uint j = 0; j < NL; ++j) {
+            ulong d = (ulong)m[j] - (ulong)om[j] - borrow;
+            mm1[j] = (uint)d;
+            borrow = (d >> 63) & 1ul;
+        }
+    }
+
+    // M-1 = d * 2^s. M ungerade -> E := M-1 ist M mit geloeschtem Bit 0.
+    // s = niedrigstes gesetztes Bit von E; topbit = hoechstes Bit von M.
+    // (Haengt nur von M ab -> einmal pro Kandidat, nicht pro Basis.)
+    uint s;
+    uint low = m[0] & ~1u;             // Bit 0 von E ist 0
+    if (low != 0u) {
+        s = ctz(low);
+    } else {
+        uint lj = 1;
+        while (lj < NL && m[lj] == 0u) { ++lj; }
+        s = lj * 32 + ctz(m[lj]);
+    }
     int topbit = -1;
     for (int j = NL - 1; j >= 0 && topbit < 0; --j) {
         if (m[j] != 0u) {
@@ -148,27 +182,38 @@ kernel void fermat_prp(device const uint*  Ms       [[buffer(0)]],   // ncand * 
         }
     }
 
-    // Links-nach-rechts-Binaerexponentiation. Exponent E = M-1: Bit 0 ist 0,
-    // alle hoeheren Bits sind die von M (M ungerade).
-    for (int i = topbit; i >= 0; --i) {
-        montmul(tmp, r, r, m, n0);          // r = r^2
-        for (uint j = 0; j < NL; ++j) { r[j] = tmp[j]; }
-        uint bit = (i == 0) ? 0u : ((m[(uint)i >> 5] >> ((uint)i & 31u)) & 1u);
-        if (bit != 0u) {
-            montmul(tmp, r, am, m, n0);     // r = r * a
+    bool prp = true;
+    for (uint bi = 0; bi < nbases && prp; ++bi) {
+        const uint abase = (bi * ncand + cand) * NL;
+        for (uint j = 0; j < NL; ++j) {
+            am[j] = aMs[abase + j];
+            r[j]  = om[j];             // Start: Montgomery-Form der 1
+        }
+
+        // x = a^d mod M (Montgomery): Bits von E von topbit hinab bis s scannen.
+        for (int i = topbit; i >= (int)s; --i) {
+            montmul(tmp, r, r, m, n0);
             for (uint j = 0; j < NL; ++j) { r[j] = tmp[j]; }
+            uint bit = (m[(uint)i >> 5] >> ((uint)i & 31u)) & 1u;
+            if (bit != 0u) {
+                montmul(tmp, r, am, m, n0);
+                for (uint j = 0; j < NL; ++j) { r[j] = tmp[j]; }
+            }
+        }
+
+        // Starker Test (in Montgomery-Form): x == 1 oder x == M-1 ?
+        bool pass = bnequal(r, om) || bnequal(r, mm1);
+        for (uint it = 1; it < s && !pass; ++it) {
+            montmul(tmp, r, r, m, n0);                 // x = x^2
+            for (uint j = 0; j < NL; ++j) { r[j] = tmp[j]; }
+            if (bnequal(r, mm1)) { pass = true; break; } // -1 gefunden
+            if (bnequal(r, om))  { break; }              // 1 vor -1 -> zusammengesetzt
+        }
+        if (!pass) {
+            prp = false;   // diese Basis bezeugt: zusammengesetzt -> Abbruch
         }
     }
-
-    // Aus Montgomery-Form heraus: r = r * 1 * R^-1 = a^(M-1) mod M
-    montmul(tmp, r, one, m, n0);
-
-    // Fermat: PRP, falls a^(M-1) == 1
-    bool is_one = (tmp[0] == 1u);
-    for (uint j = 1; j < NL && is_one; ++j) {
-        if (tmp[j] != 0u) { is_one = false; }
-    }
-    out[cand] = is_one ? 1 : 0;
+    out[cand] = prp ? 1 : 0;
 }
 )METAL";
 
@@ -217,7 +262,7 @@ int main(int argc, char** argv) {
         } else if (a == "--limit") {
             limit = atol(next("--limit").c_str());
         } else if (a == "-h" || a == "--help") {
-            printf("Aufruf: %s [--bases \"3\"] [--limit N] [--exp N] [kandidatendatei]\n", argv[0]);
+            printf("Aufruf: %s [--bases \"3 5 7\"] [--limit N] [--exp N] [kandidatendatei]\n", argv[0]);
             return 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "Unbekannte Option: %s\n", a.c_str());
@@ -275,12 +320,15 @@ int main(int argc, char** argv) {
     printf("Kandidaten: %zu, Exponent N=%lu, groesstes M ~%zu Bit -> NL=%d Limbs\n",
            ncand, exp, max_bits, NL);
 
-    // ---- CPU: M, n0, R mod M, a*R mod M je Kandidat vorbereiten ----
-    // (nur die erste Basis fuers GPU-Demo; weitere Basen unten auf der CPU.)
-    const unsigned long a0 = bases[0];
+    // ---- CPU: M, n0, R mod M, und je Basis a*R mod M vorbereiten ----
+    const uint32_t nbases = (uint32_t)bases.size();
+    std::string basestr;
+    for (size_t i = 0; i < bases.size(); ++i) {
+        basestr += (i ? " " : "") + std::to_string(bases[i]);
+    }
     std::vector<uint32_t> hostM((size_t)ncand * NL);
     std::vector<uint32_t> hostOne((size_t)ncand * NL);
-    std::vector<uint32_t> hostAm((size_t)ncand * NL);
+    std::vector<uint32_t> hostAm((size_t)ncand * nbases * NL);   // basis-major
     std::vector<uint32_t> hostN0(ncand);
 
     // Setup ist pro Kandidat unabhaengig -> ueber alle Kerne parallelisieren.
@@ -292,7 +340,6 @@ int main(int argc, char** argv) {
         mpz_t lM, R, one_mont, am, abig;
         mpz_inits(lM, R, one_mont, am, abig, nullptr);
         mpz_setbit(R, (mp_bitcnt_t)NL * 32);      // R = 2^(32*NL)
-        mpz_set_ui(abig, a0);
         for (;;) {
             size_t idx = setup_next.fetch_add(1, std::memory_order_relaxed);
             if (idx >= ncand) { break; }
@@ -305,9 +352,12 @@ int main(int argc, char** argv) {
             mpz_mod(one_mont, R, lM);             // R mod M  (Montgomery-1)
             to_limbs(one_mont, &hostOne[idx * NL], NL);
 
-            mpz_mul(am, abig, R);
-            mpz_mod(am, am, lM);                  // a*R mod M
-            to_limbs(am, &hostAm[idx * NL], NL);
+            for (uint32_t bi = 0; bi < nbases; ++bi) {
+                mpz_set_ui(abig, bases[bi]);
+                mpz_mul(am, abig, R);
+                mpz_mod(am, am, lM);              // a*R mod M
+                to_limbs(am, &hostAm[((size_t)bi * ncand + idx) * NL], NL);
+            }
         }
         mpz_clears(lM, R, one_mont, am, abig, nullptr);
     };
@@ -329,7 +379,7 @@ int main(int argc, char** argv) {
                                                options:nil
                                                  error:&err];
         if (!lib) { fprintf(stderr, "Kernel-Compile: %s\n", err.localizedDescription.UTF8String); return 1; }
-        id<MTLFunction> fn = [lib newFunctionWithName:@"fermat_prp"];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"miller_rabin"];
         id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
         if (!pso) { fprintf(stderr, "Pipeline: %s\n", err.localizedDescription.UTF8String); return 1; }
         id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -344,6 +394,7 @@ int main(int argc, char** argv) {
         id<MTLBuffer> bOut = [dev newBufferWithLength:ncand options:MTLResourceStorageModeShared];
         uint32_t nc = (uint32_t)ncand;
         id<MTLBuffer> bNc  = mkbuf(&nc, 4);
+        id<MTLBuffer> bNb  = mkbuf(&nbases, 4);
 
         // ---- Kernel ausfuehren und Zeit messen ----
         // In Bloecken dispatchen: jeder Command-Buffer bleibt kurz, damit kein
@@ -351,9 +402,14 @@ int main(int argc, char** argv) {
         // und Ergebnisse verfaelschen).
         NSUInteger tptg = pso.maxTotalThreadsPerThreadgroup;
         if (tptg > 256) { tptg = 256; }
-        const uint32_t CHUNK = 16384;
+        // Blockgroesse: klein genug, dass ein einzelner Command-Buffer nicht in
+        // den GPU-Watchdog laeuft -- aber wir warten NICHT pro Block, sondern
+        // reihen alle ein (serielle Queue) und warten erst am Ende. So laeuft die
+        // GPU ohne CPU-Synchronisationspausen durch.
+        const uint32_t CHUNK = 8192;
 
         auto t_gpu = Clock::now();
+        std::vector<id<MTLCommandBuffer>> cbs;
         for (uint32_t off = 0; off < (uint32_t)ncand; off += CHUNK) {
             uint32_t cnt = (uint32_t)std::min<size_t>(CHUNK, ncand - off);
             id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -366,14 +422,19 @@ int main(int argc, char** argv) {
             [enc setBuffer:bOut offset:0 atIndex:4];
             [enc setBuffer:bNc offset:0 atIndex:5];
             [enc setBytes:&off length:4 atIndex:6];
+            [enc setBuffer:bNb offset:0 atIndex:7];
             [enc dispatchThreads:MTLSizeMake(cnt, 1, 1)
                   threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
             [enc endEncoding];
             [cb commit];
-            [cb waitUntilCompleted];
+            cbs.push_back(cb);
+        }
+        [cbs.back() waitUntilCompleted];   // serielle Queue -> alle fertig
+        for (id<MTLCommandBuffer> cb : cbs) {
             if (cb.status != MTLCommandBufferStatusCompleted) {
-                fprintf(stderr, "GPU-Block ab %u fehlgeschlagen (Status %ld)\n",
-                        off, (long)cb.status);
+                fprintf(stderr, "GPU-Block fehlgeschlagen (Status %ld): %s\n",
+                        (long)cb.status,
+                        cb.error ? cb.error.localizedDescription.UTF8String : "(kein Detail)");
                 return 1;
             }
         }
@@ -382,27 +443,39 @@ int main(int argc, char** argv) {
         const uint8_t* gout = (const uint8_t*)bOut.contents;
         std::vector<uint8_t> gpu_res(gout, gout + ncand);
 
-        // ---- CPU-Referenz: gleicher Fermat-Test, alle Kerne ----
+        // ---- CPU-Referenz: gleicher starker Test ueber alle Basen, alle Kerne ----
         std::vector<uint8_t> cpu_res(ncand, 0);
         int nthreads = (int)std::thread::hardware_concurrency();
         if (nthreads < 1) { nthreads = 1; }
         std::atomic<size_t> nexti{0};
         auto t_cpu = Clock::now();
         auto cpuworker = [&]() {
-            mpz_t m, e, r, ab;
-            mpz_inits(m, e, r, ab, nullptr);
-            mpz_set_ui(ab, a0);
+            mpz_t m, mm1, d, r, ab;
+            mpz_inits(m, mm1, d, r, ab, nullptr);
             for (;;) {
                 size_t i = nexti.fetch_add(1, std::memory_order_relaxed);
                 if (i >= ncand) { break; }
                 mpz_ui_pow_ui(m, cands[i], exp);
                 mpz_add_ui(m, m, 1);
-                mpz_fdiv_q_2exp(m, m, 1);
-                mpz_sub_ui(e, m, 1);
-                mpz_powm(r, ab, e, m);
-                cpu_res[i] = (mpz_cmp_ui(r, 1) == 0) ? 1 : 0;
+                mpz_fdiv_q_2exp(m, m, 1);              // M = (b^N+1)/2
+                mpz_sub_ui(mm1, m, 1);                 // M-1
+                unsigned long s = mpz_scan1(mm1, 0);   // M-1 = d * 2^s
+                mpz_fdiv_q_2exp(d, mm1, s);
+                bool prp = true;
+                for (uint32_t bi = 0; bi < nbases && prp; ++bi) {
+                    mpz_set_ui(ab, bases[bi]);
+                    mpz_powm(r, ab, d, m);             // x = a^d mod M
+                    bool pass = (mpz_cmp_ui(r, 1) == 0) || (mpz_cmp(r, mm1) == 0);
+                    for (unsigned long it = 1; it < s && !pass; ++it) {
+                        mpz_powm_ui(r, r, 2, m);       // x = x^2 mod M
+                        if (mpz_cmp(r, mm1) == 0) { pass = true; break; }
+                        if (mpz_cmp_ui(r, 1) == 0) { break; }
+                    }
+                    if (!pass) { prp = false; }
+                }
+                cpu_res[i] = prp ? 1 : 0;
             }
-            mpz_clears(m, e, r, ab, nullptr);
+            mpz_clears(m, mm1, d, r, ab, nullptr);
         };
         std::vector<std::thread> pool;
         for (int tt = 0; tt < nthreads; ++tt) { pool.emplace_back(cpuworker); }
@@ -421,7 +494,7 @@ int main(int argc, char** argv) {
         printf("GPU PRP: %zu   CPU PRP: %zu   Abweichungen: %zu  (%s)\n",
                gpu_prp, cpu_prp, mism, mism == 0 ? "OK" : "FEHLER");
 
-        printf("\n--- Performance (Basis %lu, Fermat-PRP) ---\n", a0);
+        printf("\n--- Performance (Basen %s, starker Miller-Rabin) ---\n", basestr.c_str());
         printf("CPU-Setup (GMP, M + Montgomery-Konstanten): %.3f s\n", setup_secs);
         printf("GPU-Kernel (nur Rechnung):                  %.3f s\n", gpu_secs);
         printf("GPU gesamt (Setup + Kernel):                %.3f s\n", setup_secs + gpu_secs);

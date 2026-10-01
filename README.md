@@ -260,35 +260,47 @@ and only then pay for a proof on the few survivors.
 
 `prp_metal` is a GPU prototype of the PRP filter for **Regime A** — many
 medium-sized candidates, one GPU thread per candidate. The CPU (GMP) prepares each
-`M = (b^N+1)/2` and its Montgomery constants; the GPU does the heavy part, the
-modular exponentiation `a^(M-1) mod M`, using CIOS Montgomery multiplication in
-32-bit limbs. It computes the same Fermat PRP test on the CPU as well and checks
-that the GPU result matches exactly.
+`M = (b^N+1)/2` and its Montgomery constants; the GPU does the heavy part — a
+**strong Miller-Rabin** test to base `a` (decompose `M-1 = d·2^s`, then `a^d` and
+the squarings) — using CIOS Montgomery multiplication in 32-bit limbs, staying in
+the Montgomery domain throughout. It supports **several bases in one run** (a
+candidate must pass the strong test for all of them) and checks that the GPU result
+matches the same test on the CPU exactly (and it agrees with `prp_test`).
 
 ```bash
 ninja -C build prp_metal         # macOS only; needs Metal + GMP
-./build/prp_metal --bases 3 kand.txt
+./build/prp_metal --bases "3 5 7" kand.txt
 ```
 
 ### Benchmark (Apple M2 Pro, 10 CPU threads vs GPU, machine otherwise idle)
 
-GPU kernel vs the same Fermat test on all CPU cores:
+GPU kernel vs the same strong Miller-Rabin test on all CPU cores:
 
-| k | number size | candidates | kernel speedup | total speedup* |
-|---|-------------|-----------:|---------------:|---------------:|
-| 3 | ~175 bit (NL=6)  | 340,191 | **4.1×** | 2.4× |
-| 4 | ~344 bit (NL=11) | 447,528 | **3.2×** | 2.7× |
-| 6 | ~1211 bit (NL=38) | 80,375 | 1.0× | 1.0× |
+| k | number size | candidates | 1 base | 3 bases (`3 5 7`) |
+|---|-------------|-----------:|-------:|------------------:|
+| 3 | ~175 bit (NL=6)  | 340,191 | **3.8×** | 2.5× |
+| 4 | ~344 bit (NL=11) | 447,528 | **3.5×** | 1.4× |
+| 6 | ~1211 bit (NL=38) | 80,375 | 1.1× | 0.3× |
 
-*total includes the (parallelized) CPU setup. GPU and CPU PRP sets matched exactly
-in every run. Numbers are lower than on a loaded machine — a busy CPU (e.g. BOINC
-running) slows the CPU baseline and inflates the apparent GPU advantage; measure on
-an idle machine for a fair comparison.
+(kernel speedup; GPU and CPU PRP sets matched exactly in every run.) Numbers are
+lower than on a loaded machine — a busy CPU (e.g. BOINC running) slows the CPU
+baseline and inflates the apparent GPU advantage; measure on an idle machine.
 
-> Work is dispatched in chunks (one command buffer each) so no single dispatch runs
-> long enough to hit the GPU watchdog. A single multi-second dispatch had threads
-> aborted mid-flight, silently producing too few PRPs — always cross-check GPU
-> against CPU, as this tool does.
+**Why extra bases help the GPU less than the CPU — SIMD divergence.** On the CPU,
+most composites fail the first base and are dropped immediately, so three bases cost
+barely more than one. On the GPU, threads run in lockstep within a SIMD group: if
+*any* thread in the group is a survivor that needs all three bases, the whole group
+pays for all three. So the GPU does close to 3× the work while the CPU does barely
+more — which is why the 3-base speedups are markedly lower, and dip below 1× once
+the per-thread work is already heavy (`NL=38`). Multiple bases are still useful as a
+stronger filter; just expect the GPU edge to shrink.
+
+> Work is dispatched in chunks (one command buffer each) so no single buffer runs
+> long enough to hit the GPU watchdog — a multi-second dispatch had threads aborted
+> mid-flight, silently producing too few PRPs (always cross-check GPU against CPU, as
+> this tool does). The chunks are all enqueued first and awaited only at the end, so
+> the GPU runs them back-to-back without per-chunk CPU stalls (waiting after every
+> small chunk was itself a 5× slowdown).
 
 **The lesson:** this one-thread-per-candidate approach wins when the numbers are
 small enough to stay in registers (high GPU occupancy) and there are many of them.
@@ -298,9 +310,8 @@ highly-tuned GMP on the CPU. For **large k** (tens of thousands of digits) the r
 approach is a different one entirely: a single FFT/NTT-based squaring spread across
 the whole GPU (as in `genefer`/`gpuOwl`), not one thread per candidate.
 
-> Prototype limits: Fermat test (not strong Miller-Rabin), single base per run on
-> the GPU, and `NL ≤ 128` limbs (~4096 bit). CUDA (for NVIDIA) is a planned port of
-> the same kernel; the Montgomery math is identical.
+> Prototype limit: `NL ≤ 128` limbs (~4096 bit). CUDA (for NVIDIA) is a planned
+> port of the same kernel; the Montgomery math is identical.
 
 ## Legacy: `run_pfgw.sh`
 
