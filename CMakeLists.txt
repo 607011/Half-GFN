@@ -77,6 +77,21 @@ target_link_libraries(hgfn_sieve PRIVATE hgfn_flags Threads::Threads)
 add_executable(prp_test prp_test.cpp)
 target_link_libraries(prp_test PRIVATE hgfn_flags Threads::Threads GMP::GMP)
 
+# Optional: GPU-accelerated PRP test via Apple Metal (macOS only, Regime A).
+if(APPLE)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+        add_executable(prp_metal prp_metal.mm)
+        set_source_files_properties(prp_metal.mm PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(prp_metal PRIVATE
+            hgfn_flags GMP::GMP ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+    else()
+        message(STATUS "Metal/Foundation not found -- skipping prp_metal.")
+    endif()
+endif()
+
 # Stage 3 (prove.sh) needs PARI/GP's `gp` binary at runtime, not at build time.
 find_program(GP_EXECUTABLE gp)
 if(NOT GP_EXECUTABLE)

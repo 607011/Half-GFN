@@ -256,6 +256,52 @@ and only then pay for a proof on the few survivors.
 
 ---
 
+## GPU acceleration (experimental, macOS / Metal)
+
+`prp_metal` is a GPU prototype of the PRP filter for **Regime A** — many
+medium-sized candidates, one GPU thread per candidate. The CPU (GMP) prepares each
+`M = (b^N+1)/2` and its Montgomery constants; the GPU does the heavy part, the
+modular exponentiation `a^(M-1) mod M`, using CIOS Montgomery multiplication in
+32-bit limbs. It computes the same Fermat PRP test on the CPU as well and checks
+that the GPU result matches exactly.
+
+```bash
+ninja -C build prp_metal         # macOS only; needs Metal + GMP
+./build/prp_metal --bases 3 kand.txt
+```
+
+### Benchmark (Apple M2 Pro, 10 CPU threads vs GPU, machine otherwise idle)
+
+GPU kernel vs the same Fermat test on all CPU cores:
+
+| k | number size | candidates | kernel speedup | total speedup* |
+|---|-------------|-----------:|---------------:|---------------:|
+| 3 | ~175 bit (NL=6)  | 340,191 | **4.1×** | 2.4× |
+| 4 | ~344 bit (NL=11) | 447,528 | **3.2×** | 2.7× |
+| 6 | ~1211 bit (NL=38) | 80,375 | 1.0× | 1.0× |
+
+*total includes the (parallelized) CPU setup. GPU and CPU PRP sets matched exactly
+in every run. Numbers are lower than on a loaded machine — a busy CPU (e.g. BOINC
+running) slows the CPU baseline and inflates the apparent GPU advantage; measure on
+an idle machine for a fair comparison.
+
+> Work is dispatched in chunks (one command buffer each) so no single dispatch runs
+> long enough to hit the GPU watchdog. A single multi-second dispatch had threads
+> aborted mid-flight, silently producing too few PRPs — always cross-check GPU
+> against CPU, as this tool does.
+
+**The lesson:** this one-thread-per-candidate approach wins when the numbers are
+small enough to stay in registers (high GPU occupancy) and there are many of them.
+As the limb count grows the per-thread big-integer arrays spill and the schoolbook
+`O(limbs²)` cost rises, so the advantage fades — around `NL≈38` it merely ties
+highly-tuned GMP on the CPU. For **large k** (tens of thousands of digits) the right
+approach is a different one entirely: a single FFT/NTT-based squaring spread across
+the whole GPU (as in `genefer`/`gpuOwl`), not one thread per candidate.
+
+> Prototype limits: Fermat test (not strong Miller-Rabin), single base per run on
+> the GPU, and `NL ≤ 128` limbs (~4096 bit). CUDA (for NVIDIA) is a planned port of
+> the same kernel; the Montgomery math is identical.
+
 ## Legacy: `run_pfgw.sh`
 
 An earlier wrapper driving [OpenPFGW](https://sourceforge.net/projects/openpfgw/)
@@ -294,6 +340,7 @@ primes.txt
 |------|-------------|
 | `hgfn_sieve.cpp` | the sieve (C++17, std::thread, checkpointing) |
 | `prp_test.cpp` | strong PRP test (C++17, GMP, journaling) |
+| `prp_metal.mm` | GPU PRP prototype (Apple Metal, macOS only) |
 | `prove.sh` | primality proof driver (PARI/GP, journaling) |
 | `hgfn_sieve.py` | the original Python reference implementation of the sieve |
 | `run_pfgw.sh` | legacy PFGW-based PRP wrapper (x86) |
