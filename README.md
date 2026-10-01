@@ -1,12 +1,12 @@
-# hgfn_sieve — half generalized Fermat number prime hunting
+# HGFN — Half Generalized Fermat Number prime hunting
 
-A small, self-contained, **ARM-native** toolchain for hunting primes of the form
+A small, self-contained toolchain for hunting primes of the form
 
 ```
 M(b) = (b^N + 1) / 2 ,   N = 2^k ,   b odd
 ```
 
-("half generalized Fermat numbers"). It runs entirely offline, independent of any
+("Half Generalized Fermat Numbers"). It runs entirely offline, independent of any
 collaborative prime search, and takes you from a raw base range all the way to a
 rigorous primality **proof** in three stages:
 
