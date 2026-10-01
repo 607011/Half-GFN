@@ -32,7 +32,7 @@ Tab-separated, append-only. One row per proven block:
 
 ## `primes/k<K>/<start>-<end>.txt` and `prp/k<K>/<start>-<end>.txt`
 
-Proven prime bases (resp. PRP survivors) of one 1,000,000-base block: a `#` header
+Proven prime bases (resp. PRP survivors) of one block: a `#` header
 then one base `b` per line.
 
 `prp/` is a **staging area — the proof queue**: it holds the PRP survivors only for

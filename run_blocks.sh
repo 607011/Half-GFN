@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_blocks.sh  --  Processes 1,000,000-base blocks for a fixed k end to end
+# run_blocks.sh  --  Processes fixed-size base blocks for a fixed k end to end
 # (sieve -> PRP -> proof), records them in the ledger and stores the results.
 # Resumable on TWO levels:
 #   * block level: blocks whose proof is in coverage.tsv are skipped -- an
@@ -11,12 +11,15 @@
 # Usage:
 #   ./run_blocks.sh --k K --from START --to END [options]
 # Options:
+#   --block SIZE   bases per block (default 1000000). Shrink it for large k,
+#                  where even one block of 1e6 would take far too long.
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
 #   --bases "..."  PRP bases (default "3 5 7")
 #   --ecpp         prove with ECPP instead of APR-CL
 #   -h | --help
 #
-# START/END are multiples of 1,000,000; processes [START, END) block by block.
+# Processes [START, END) in steps of --block. START/END/SIZE should be chosen so
+# the blocks tile consistently (multiples of SIZE).
 #
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
@@ -31,6 +34,7 @@ while [ $# -gt 0 ]; do
         --k)      K="$2"; shift 2 ;;
         --from)   FROM="$2"; shift 2 ;;
         --to)     TO="$2"; shift 2 ;;
+        --block)  BLOCK="$2"; shift 2 ;;
         --plimit) PLIMIT="$2"; shift 2 ;;
         --bases)  BASES="$2"; shift 2 ;;
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
@@ -81,9 +85,9 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start,$end)"
       grep '^[0-9]' "$PR" || true; } > "results/primes/k$K/${start}-${end}.txt"
 
-    ./coverage.sh record "$K" "$start" sieve "plimit=$PLIMIT" "$nsieve" >/dev/null
-    ./coverage.sh record "$K" "$start" prp   "bases=$BASES_CSV"  "$nprp"   >/dev/null
-    ./coverage.sh record "$K" "$start" proof "method=$METHOD"    "$nprimes" >/dev/null
+    ./coverage.sh record "$K" "$start" "$end" sieve "plimit=$PLIMIT" "$nsieve" >/dev/null
+    ./coverage.sh record "$K" "$start" "$end" prp   "bases=$BASES_CSV"  "$nprp"   >/dev/null
+    ./coverage.sh record "$K" "$start" "$end" proof "method=$METHOD"    "$nprimes" >/dev/null
 
     if [ "$nprimes" -gt 0 ]; then
         maxb=$(grep '^[0-9]' "$PR" | sort -n | tail -1)

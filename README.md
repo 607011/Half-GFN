@@ -340,19 +340,24 @@ been done with which parameters*. `coverage.sh` maintains an append-only ledger,
 | small valuable results | PRP survivors, proven primes | **yes** |
 | bulk reproducible intermediates | full candidate lists, `*.ckpt`, `*.done` | **no** (gitignored) |
 
-Work is tracked in fixed, non-overlapping **blocks of 1,000,000 bases** (block `b`
-covers odd bases in `[b, b+1000000)`). "Done" always carries its parameters — sieved
+Work is tracked in non-overlapping **blocks** of bases `[block_start, block_end)`.
+The block **size is not fixed**: 1,000,000 is fine for small `k`, but large `k` needs
+blocks orders of magnitude smaller (one base can be very expensive), so both bounds
+are stored explicitly in the ledger. "Done" always carries its parameters too — sieved
 to `plimit=1e9` is not the same as `1e12`, and PRP with bases `{3,5,7}` is not `{3}` —
 so a completed block is unambiguous and reproducible.
 
 ```bash
-# after finishing a stage on a block, record it:
-./coverage.sh record 15 0 sieve plimit=1e9 157063
-./coverage.sh record 8  0 prp   bases=3,5,7 12345
+# after finishing a stage on a block, record it (note: explicit block_end):
+./coverage.sh record 15 0 1000000 sieve plimit=1e9 157063
+./coverage.sh record 8  0 1000000 prp   bases=3,5,7 12345
 
 ./coverage.sh status   # regenerate STATUS.md (human-readable table)
 ./coverage.sh todo     # blocks where PRP is done but the proof is still pending
 ```
+
+`run_blocks.sh` drives this for a whole range; `--block SIZE` sets the block size
+(default 1e6) — shrink it for large `k`.
 
 `STATUS.md` is generated from the ledger — never edit it by hand. Each completion is
 a single appended line, so two machines rarely produce a merge conflict; regenerate
@@ -372,7 +377,7 @@ git add claims.tsv && git commit -m "claim k8 b0 proof" && git push
 #   push rejected?  ->  git pull, pick another block, retry (nothing computed yet)
 #   push accepted?  ->  ONLY NOW start computing
 ./prove.sh ...                         # the actual (hours/days) work
-./coverage.sh record 8 0 proof method=aprcl 123   # done = releases the block
+./coverage.sh record 8 0 1000000 proof method=aprcl 123   # done = releases the block
 git add -A && git commit && git push
 ```
 

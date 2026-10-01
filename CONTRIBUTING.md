@@ -30,7 +30,8 @@ Quick sanity check (should report 21 primes):
 
 ## Contributing compute
 
-Work is tracked in fixed **1,000,000-base blocks** per exponent `k`, recorded in
+Work is tracked in **blocks** of bases per exponent `k` (size configurable via
+`run_blocks.sh --block`, default 1,000,000 — shrink it for large `k`), recorded in
 `coverage.tsv` (progress) and `claims.tsv` (who is working on what). The git repo
 itself is the coordination lock — no server.
 

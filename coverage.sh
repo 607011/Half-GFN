@@ -7,16 +7,18 @@
 # PARAMETERS -- unambiguous, auditable, and git-mergeable (each completion is
 # exactly one new line at the end).
 #
-# Block size: 1,000,000 bases. Block b covers the odd bases in
-# [b, b+1,000,000). block_start should be a multiple of 1,000,000.
+# Block sizes may VARY (e.g. orders of magnitude smaller for large k, where even
+# one base is expensive). A block covers the odd bases in [block_start, block_end);
+# both bounds are stored explicitly, so no fixed size is baked in. Within one k,
+# tile consistently from 0 at whatever size you choose for that k.
 #
 # Stages: sieve  (params: plimit=...)
 #         prp    (params: bases=3,5,7)
 #         proof  (params: method=aprcl|ecpp)
 #
 # Usage:
-#   ./coverage.sh record K BLOCK_START STAGE PARAMS COUNT
-#        e.g.  ./coverage.sh record 15 0 sieve plimit=1e9 80375
+#   ./coverage.sh record K BLOCK_START BLOCK_END STAGE PARAMS COUNT
+#        e.g.  ./coverage.sh record 15 0 1000000 sieve plimit=1e9 80375
 #   ./coverage.sh status      # generate STATUS.md from coverage.tsv
 #   ./coverage.sh todo        # blocks with PRP done but proof pending
 #   ./coverage.sh claim   K BLOCK_START STAGE [TTL_HOURS]   # reserve a block
@@ -37,7 +39,6 @@ set -euo pipefail
 
 LEDGER="coverage.tsv"
 CLAIMS="claims.tsv"
-BLOCK=1000000
 TAB=$(printf '\t')
 # Lease duration in hours (configurable). Default 7 days -- long tasks
 # (deep sieving, big proofs) must not expire mid-run.
@@ -67,19 +68,18 @@ append_claim() {
 }
 
 cmd_record() {
-    if [ $# -lt 5 ]; then
-        echo "Usage: $0 record K BLOCK_START STAGE PARAMS COUNT" >&2
+    if [ $# -lt 6 ]; then
+        echo "Usage: $0 record K BLOCK_START BLOCK_END STAGE PARAMS COUNT" >&2
         exit 2
     fi
-    local K="$1" BS="$2" STAGE="$3" PARAMS="$4" COUNT="$5"
+    local K="$1" BS="$2" BE="$3" STAGE="$4" PARAMS="$5" COUNT="$6"
     case "$STAGE" in
         sieve|prp|proof) ;;
         *) echo "Unknown stage: $STAGE (sieve|prp|proof)" >&2; exit 2 ;;
     esac
-    if [ $(( BS % BLOCK )) -ne 0 ]; then
-        echo "Warning: block_start $BS is not a multiple of $BLOCK." >&2
+    if [ "$BE" -le "$BS" ]; then
+        echo "Warning: block_end $BE <= block_start $BS." >&2
     fi
-    local BE=$(( BS + BLOCK ))
     local date commit host
     date=$(date -u +%Y-%m-%d)
     commit=$(git rev-parse --short HEAD 2>/dev/null || echo "-")
@@ -156,7 +156,7 @@ cmd_status() {
     {
         echo "# Coverage status"
         echo
-        echo "_Generated automatically from \`coverage.tsv\` (block size ${BLOCK})._"
+        echo "_Generated automatically from \`coverage.tsv\` (block sizes may vary by k)._"
         echo "_Do not edit by hand -- run \`./coverage.sh status\`._"
         # For each (k, block) collect the most recently reported params per stage,
         # then emit as Markdown tables sorted numerically by k and block.
