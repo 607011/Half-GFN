@@ -132,6 +132,7 @@ per line) to the output file, with a header recording `N` and the sieve limit.
 | `--threads N` | all cores | worker threads |
 | `--checkpoint FILE` | *(off)* | enable checkpointing to `FILE` |
 | `--checkpoint-interval S` | `60` | seconds between checkpoints |
+| `--pause-file FILE` | *(off)* | pause at block boundaries while `FILE` exists |
 
 ### Checkpointing
 
@@ -154,6 +155,19 @@ full bitmap) is written atomically (`.tmp` + `rename`).
 
 > The checkpoint format is raw little-endian bytes and is machine-local (not
 > portable across architectures).
+
+### Pausing
+
+With `--pause-file FILE`, the sieve pauses at the next block boundary whenever
+`FILE` exists and resumes when it is removed — a cross-platform trigger that also
+works for background and piped runs (no TTY required):
+
+```bash
+touch sieve.pause   # pause after the current block (a checkpoint is written first)
+rm sieve.pause      # resume
+```
+
+Combine it with `--checkpoint` so a paused run can also be killed safely.
 
 ---
 

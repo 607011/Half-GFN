@@ -32,6 +32,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 
 using u64 = uint64_t;
 using u128 = unsigned __int128;
@@ -282,7 +283,8 @@ struct SieveResult {
 
 static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
                          int nthreads, const std::string& ckpt_path,
-                         double ckpt_interval, double report_every = 10.0) {
+                         double ckpt_interval, const std::string& pause_file,
+                         double report_every = 10.0) {
     const u64 N = (u64)1 << k;
     const u64 step = 2 * N;
 
@@ -321,6 +323,36 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
 
     u64 j = next_j;
     while (j <= jmax) {
+        // Pause? (am Blockrand, analog zu Checkpoint/Stop) Ausgeloest durch die
+        // Existenz der Pause-Datei -- plattformuebergreifend und auch im
+        // Hintergrund nutzbar. Vor dem Warten sicherheitshalber ein Checkpoint.
+        if (!pause_file.empty() && std::filesystem::exists(pause_file)) {
+            if (!ckpt_path.empty()) {
+                if (save_checkpoint(ckpt_path, k, bmin, bmax, j, primes_used.load(), alive)) {
+                    fprintf(stderr, "  [Checkpoint vor Pause: next_j=%llu]\n",
+                            (unsigned long long)j);
+                }
+            }
+            fprintf(stderr, "Pausiert (Datei '%s' vorhanden) -- loeschen zum Fortsetzen.\n",
+                    pause_file.c_str());
+            fflush(stderr);
+            while (std::filesystem::exists(pause_file) && !g_stop) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (!g_stop) {
+                fprintf(stderr, "Fortgesetzt.\n");
+                fflush(stderr);
+            }
+            // Pausendauer nicht gegen Report-/Checkpoint-Intervalle zaehlen.
+            auto resume_now = std::chrono::steady_clock::now();
+            t_last_report = resume_now;
+            t_last_ckpt = resume_now;
+        }
+
+        if (g_stop) {   // Stop (ggf. waehrend der Pause) -> Schleife verlassen
+            break;
+        }
+
         u64 chunk_end = j + CHUNK;
         if (chunk_end > jmax + 1) {
             chunk_end = jmax + 1;
@@ -370,15 +402,18 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
             t_last_ckpt = now;
         }
 
-        if (g_stop) {
-            interrupted = true;
-            fprintf(stderr, "Abbruch angefordert -- ");
-            if (ckpt_path.empty()) {
-                fprintf(stderr, "kein --checkpoint gesetzt, Fortschritt geht verloren.\n");
-            } else {
-                fprintf(stderr, "Checkpoint geschrieben, gleicher Aufruf setzt fort.\n");
-            }
-            break;
+        if (g_stop) {   // Stop nach vollendetem Block -> oben wird abgebrochen
+            continue;
+        }
+    }
+
+    if (g_stop) {
+        interrupted = true;
+        fprintf(stderr, "Abbruch angefordert -- ");
+        if (ckpt_path.empty()) {
+            fprintf(stderr, "kein --checkpoint gesetzt, Fortschritt geht verloren.\n");
+        } else {
+            fprintf(stderr, "Checkpoint geschrieben, gleicher Aufruf setzt fort.\n");
         }
     }
 
@@ -407,6 +442,7 @@ int main(int argc, char** argv) {
     std::string out = "kandidaten.txt";
     std::string ckpt_path;
     double ckpt_interval = 60.0;
+    std::string pause_file;
     int nthreads = (int)std::thread::hardware_concurrency();
     if (nthreads < 1) {
         nthreads = 1;
@@ -437,12 +473,16 @@ int main(int argc, char** argv) {
             ckpt_path = next("--checkpoint");
         } else if (a == "--checkpoint-interval") {
             ckpt_interval = atof(next("--checkpoint-interval"));
+        } else if (a == "--pause-file") {
+            pause_file = next("--pause-file");
         } else if (a == "-h" || a == "--help") {
             printf("Aufruf: %s --k K --bmax BMAX [--bmin 3] [--plimit 1e8] "
                    "[--out kandidaten.txt] [--threads N]\n"
-                   "        [--checkpoint DATEI] [--checkpoint-interval SEK]\n"
+                   "        [--checkpoint DATEI] [--checkpoint-interval SEK] [--pause-file DATEI]\n"
                    "  Existiert die Checkpoint-Datei, wird automatisch fortgesetzt.\n"
-                   "  Strg-C schreibt am naechsten Blockrand einen Checkpoint und endet.\n",
+                   "  Strg-C schreibt am naechsten Blockrand einen Checkpoint und endet.\n"
+                   "  --pause-file: solange die Datei existiert, pausiert das Sieb am\n"
+                   "                Blockrand (loeschen zum Fortsetzen).\n",
                    argv[0]);
             return 0;
         } else {
@@ -463,7 +503,8 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    SieveResult res = sieve(k, bmin, bmax, plimit, nthreads, ckpt_path, ckpt_interval);
+    SieveResult res = sieve(k, bmin, bmax, plimit, nthreads, ckpt_path, ckpt_interval,
+                            pause_file);
 
     if (res.interrupted) {
         printf("\nAbgebrochen nach %.1f s (%llu Siebprimzahlen). "
