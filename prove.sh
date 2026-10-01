@@ -79,7 +79,13 @@ awk -v lim="$LIMIT" '
     /^[0-9]+/ { c++; if (lim>0 && c>lim) exit; print $1 }
 ' "$INFILE" > "$ALL"
 NALL=$(wc -l < "$ALL" | tr -d ' ')
-[ "$NALL" -gt 0 ] || { echo "No bases in $INFILE." >&2; exit 1; }
+# Empty input is not an error: nothing to prove -> 0 primes, clean exit. (A block
+# with 0 PRP survivors is a legitimate result, common for small blocks at large k.)
+if [ "$NALL" -eq 0 ]; then
+    : > "$OUT"
+    echo "No bases in $INFILE -- nothing to prove (0 proven)."
+    exit 0
+fi
 
 # Journal (resume): drop bases already tested (column 1).
 NDONE=0
