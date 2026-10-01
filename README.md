@@ -322,6 +322,67 @@ hosts. On ARM, prefer `prp_test`.
 
 ---
 
+## Tracking progress across runs and machines
+
+A long search spread over time and several machines needs a record of *what has
+been done with which parameters*. `coverage.sh` maintains an append-only ledger,
+`coverage.tsv`, separating three kinds of artifact by how reproducible they are:
+
+| artifact | example | in git? |
+|---|---|---|
+| the ledger (which blocks/stages/params are done) | `coverage.tsv` | **yes** — small, the index of the work |
+| small valuable results | PRP survivors, proven primes | **yes** |
+| bulk reproducible intermediates | full candidate lists, `*.ckpt`, `*.done` | **no** (gitignored) |
+
+Work is tracked in fixed, non-overlapping **blocks of 1,000,000 bases** (block `b`
+covers odd bases in `[b, b+1000000)`). "Done" always carries its parameters — sieved
+to `plimit=1e9` is not the same as `1e12`, and PRP with bases `{3,5,7}` is not `{3}` —
+so a completed block is unambiguous and reproducible.
+
+```bash
+# after finishing a stage on a block, record it:
+./coverage.sh record 15 0 sieve plimit=1e9 157063
+./coverage.sh record 8  0 prp   bases=3,5,7 12345
+
+./coverage.sh status   # regenerate STATUS.md (human-readable table)
+./coverage.sh todo     # blocks where PRP is done but the proof is still pending
+```
+
+`STATUS.md` is generated from the ledger — never edit it by hand. Each completion is
+a single appended line, so two machines rarely produce a merge conflict; regenerate
+`STATUS.md` after merging. `todo` is the proof queue: it lists exactly the blocks
+whose sieve+PRP are complete, so a deterministic proof can run over them.
+
+### Distributing work across machines (no wasted CPU)
+
+Several machines coordinate through the git repo itself — no server. A short-lived
+**claim** (lease) in `claims.tsv` reserves a block before work starts:
+
+```bash
+git pull
+./coverage.sh todo                     # or status — find a free block
+./coverage.sh claim 8 0 proof          # reserve it (lease, default 7 days)
+git add claims.tsv && git commit -m "claim k8 b0 proof" && git push
+#   push rejected?  ->  git pull, pick another block, retry (nothing computed yet)
+#   push accepted?  ->  ONLY NOW start computing
+./prove.sh ...                         # the actual (hours/days) work
+./coverage.sh record 8 0 proof method=aprcl 123   # done = releases the block
+git add -A && git commit && git push
+```
+
+**Why this wastes zero CPU.** The lock is the claim *push*, which takes seconds; the
+work takes hours or days. `git push` to the shared branch is atomic — if two machines
+race, exactly one push succeeds and the other is rejected. The loser hasn't computed
+anything yet; it just pulls and picks another block (milliseconds lost, never CPU
+time). The iron rule: **computation begins only after the claim push succeeds.**
+
+Leases exist only for crash recovery: a claim expires after the TTL
+(`COVERAGE_TTL_HOURS`, default 168 h) so a dead machine's block frees up. For runs
+longer than the TTL, extend with `./coverage.sh renew`; `release` frees a block early,
+and a `record` (done) releases it implicitly. This assumes trusted workers (your own
+machines) — opening the search to outside contributors needs result verification, see
+[TODO.md](TODO.md).
+
 ## File formats
 
 - **Candidate / PRP file:** first line is a header
@@ -356,3 +417,9 @@ primes.txt
 | `hgfn_sieve.py` | the original Python reference implementation of the sieve |
 | `run_pfgw.sh` | legacy PFGW-based PRP wrapper (x86) |
 | `CMakeLists.txt` | CMake build (Ninja generator) for `hgfn_sieve` and `prp_test` |
+| `coverage.sh` | progress ledger: record completed blocks, generate `STATUS.md`, list the proof queue |
+| `coverage.tsv` | append-only coverage ledger (which blocks/stages/params are done) |
+| `claims.tsv` | append-only lease ledger (which blocks are currently being worked on) |
+| `STATUS.md` | human-readable coverage table (generated) |
+| `results/` | small kept results: proven primes (`primes.tsv`) and PRP survivors per block |
+| `TODO.md` | deferred ideas / roadmap |

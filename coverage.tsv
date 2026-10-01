@@ -1,0 +1,4 @@
+# date	k	block_start	block_end	stage	params	count	commit	host
+2026-10-01	15	0	1000000	sieve	plimit=1e9	157063	ac55dfd	Ollis-Mac-mini-M2-Pro-5
+2026-10-01	8	0	1000000	sieve	plimit=1e7	258933	ac55dfd	Ollis-Mac-mini-M2-Pro-5
+2026-10-01	8	0	1000000	prp	bases=3,5,7	2188	ac55dfd	Ollis-Mac-mini-M2-Pro-5
