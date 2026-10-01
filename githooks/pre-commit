@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# pre-commit: Haelt die Invariante "ein bewiesener Block hat keine PRP-Staging-
+# Datei mehr". Fuer jede results/prp/k<K>/<start>-<end>.txt wird geprueft, ob in
+# coverage.tsv ein proof-Eintrag fuer (K, start) steht; falls ja, wird die Datei
+# aus diesem Commit entfernt -- aber nur, wenn dabei keine Information verloren
+# geht (PRP-Anzahl == Primzahl-Anzahl, also keine Pseudoprimzahlen).
+#
+# Aktivieren (einmalig pro Klon):  git config core.hooksPath githooks
+#
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+LEDGER=coverage.tsv
+[ -f "$LEDGER" ] || exit 0
+
+shopt -s nullglob
+for f in results/prp/k*/*.txt; do
+    k=$(printf '%s' "$f"     | sed -nE 's#results/prp/k([0-9]+)/.*#\1#p')
+    base=$(basename "$f")
+    start=$(printf '%s' "$base" | sed -nE 's#^([0-9]+)-[0-9]+\.txt$#\1#p')
+    [ -n "$k" ] && [ -n "$start" ] || continue
+
+    # proof fuer (k, start) im Register?
+    if awk -F'\t' -v k="$k" -v s="$start" \
+        '$2==k && $3==s && $5=="proof" { f=1 } END { exit f?0:1 }' "$LEDGER"; then
+
+        primes="results/primes/k$k/$base"
+        prpn=$(grep -c '^[0-9]' "$f" 2>/dev/null || true)
+        prn=$(grep -c '^[0-9]' "$primes" 2>/dev/null || true)
+        prpn=${prpn:-0}; prn=${prn:-0}
+
+        if [ -f "$primes" ] && [ "$prpn" = "$prn" ]; then
+            # getrackt/gestaged -> git rm (staged die Loeschung); sonst nur rm.
+            git rm -f --quiet "$f" 2>/dev/null || rm -f "$f"
+            rmdir "$(dirname "$f")" 2>/dev/null || true   # leeres k<K>/ entfernen
+            echo "pre-commit: bewiesener Block -> $f entfernt (Ergebnis in $primes)"
+        else
+            echo "pre-commit: WARN behalte $f -- primes=$prn vs prp=$prpn" \
+                 "(Pseudoprimzahlen? primes-Datei fehlt?)" >&2
+        fi
+    fi
+done
+
+exit 0

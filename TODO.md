@@ -23,6 +23,20 @@ What this needs:
 - **Redundancy policy.** Decide replication factor (e.g. every block done by ≥2
   independent workers) vs. trust-but-audit (spot-check a random sample).
 
+**Central enforcement (not a client hook).** The local `githooks/pre-commit` only
+gives fast feedback on one machine and is bypassable / absent on forks. In the
+current trusted direct-push model that is enough — the cleanup commit propagates
+with the push, so nothing central is needed. With PRs from untrusted contributors it
+is not: GitHub.com has no server-side hooks (`pre-receive` is Enterprise-only), so the
+authoritative layer is **GitHub Actions**:
+- `on: pull_request` — a required status check that validates invariants read-only
+  (no `prp/` for a proved block, `n_prp == n_primes`, well-formed `coverage.tsv`,
+  claims respected) so a violating PR cannot merge.
+- `on: push`/scheduled — a bot job that authoritatively reconciles and commits the
+  cleanup back to `main` (the "central aufräumen" after an accepted PR).
+Same CI gate is where result **verification** lives (re-check certificates, recompute
+samples) before a block counts as done.
+
 Until then: owner's own machines only, trusted, no verification needed.
 
 ## Other deferred items
@@ -33,6 +47,15 @@ Until then: owner's own machines only, trusted, no verification needed.
 - **FFT/NTT GPU PRP for large k** (tens of thousands of digits) — one big squaring
   spread across the GPU, à la `genefer`/`gpuOwl`; the current one-thread-per-candidate
   kernel is only for medium sizes.
+- **Checkpointable large-k proofs via `primecert`.** `isprime` is single-shot (no
+  resume), which becomes painful when one proof runs for days. PARI's
+  `primecert(N, 0, partial)` returns a *partial* ECPP certificate — a prefix of the
+  Atkin-Morain descent chain. Persist it, resume by certifying the last remaining
+  `N_i` and appending, so every completed descent step is a durable checkpoint.
+  Bonus: the resulting certificate is independently checkable with
+  `primecertisvalid`, so this doubles as the verification primitive for the
+  distributed/cross-verification item above (verify a cert cheaply instead of
+  re-proving). Switch `prove.sh` to this for large k; keep plain `isprime` for small.
 - **Auto-renew leases** from the long-running tools: have `hgfn_sieve` (at each
   checkpoint) and `prove.sh` call `coverage.sh renew`, so the lease TTL can be short
   while a live worker keeps its claim fresh.

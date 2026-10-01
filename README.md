@@ -111,6 +111,10 @@ at runtime by `prove.sh`.
 Each stage reads the exponent `N` automatically from the header line of its input
 file, so you only specify `--k` once.
 
+**Want to take part?** See [CONTRIBUTING.md](CONTRIBUTING.md) for how to claim a block
+without duplicating work, run the pipeline, and record results — plus the code
+conventions.
+
 ---
 
 ## Stage 1 — `hgfn_sieve`
@@ -128,7 +132,7 @@ per line) to the output file, with a header recording `N` and the sieve limit.
 | `--bmax BMAX` | *(required)* | upper base bound |
 | `--bmin B` | `3` | lower base bound |
 | `--plimit P` | `1e8` | sieve up to this prime (accepts `1e9` style) |
-| `--out FILE` | `kandidaten.txt` | output file for surviving bases |
+| `--out FILE` | `candidates.txt` | output file for surviving bases |
 | `--threads N` | all cores | worker threads |
 | `--checkpoint FILE` | *(off)* | enable checkpointing to `FILE` |
 | `--checkpoint-interval S` | `60` | seconds between checkpoints |
@@ -313,12 +317,14 @@ the whole GPU (as in `genefer`/`gpuOwl`), not one thread per candidate.
 > Prototype limit: `NL ≤ 128` limbs (~4096 bit). CUDA (for NVIDIA) is a planned
 > port of the same kernel; the Montgomery math is identical.
 
-## Legacy: `run_pfgw.sh`
+## Retired (`___attic/`)
 
-An earlier wrapper driving [OpenPFGW](https://sourceforge.net/projects/openpfgw/)
-for the PRP stage. **Superseded by `prp_test`** on Apple Silicon: PFGW ships only
-x86 binaries (Rosetta, going away in a future macOS). Kept for reference / non-ARM
-hosts. On ARM, prefer `prp_test`.
+- `___attic/run_pfgw.sh` — an earlier wrapper driving
+  [OpenPFGW](https://sourceforge.net/projects/openpfgw/) for the PRP stage.
+  Superseded by `prp_test`: PFGW ships only x86 binaries (Rosetta, going away in a
+  future macOS), whereas `prp_test` is ARM-native.
+- `___attic/hgfn_sieve.py` — the original Python reference implementation of the
+  sieve, superseded by `hgfn_sieve.cpp` but kept as a readable spec.
 
 ---
 
@@ -383,6 +389,21 @@ and a `record` (done) releases it implicitly. This assumes trusted workers (your
 machines) — opening the search to outside contributors needs result verification, see
 [TODO.md](TODO.md).
 
+### Automatic staging cleanup (git hook)
+
+Once a block is proved, its `results/prp/` staging file is redundant (see below). A
+tracked `pre-commit` hook removes it automatically when you commit the `proof` record
+— but only when nothing is lost (`n_prp == n_primes`); otherwise it warns and keeps
+the file. Enable it once per clone:
+
+```bash
+git config core.hooksPath githooks
+```
+
+The hook is a convenience (bypassable with `git commit --no-verify`); the invariant
+it enforces — a proved block keeps only `results/primes/`, not `results/prp/` — also
+holds if you delete the file by hand.
+
 ## File formats
 
 - **Candidate / PRP file:** first line is a header
@@ -414,8 +435,7 @@ primes.txt
 | `prp_test.cpp` | strong PRP test (C++17, GMP, journaling) |
 | `prp_metal.mm` | GPU PRP prototype (Apple Metal, macOS only) |
 | `prove.sh` | primality proof driver (PARI/GP, journaling) |
-| `hgfn_sieve.py` | the original Python reference implementation of the sieve |
-| `run_pfgw.sh` | legacy PFGW-based PRP wrapper (x86) |
+| `___attic/` | retired files kept for reference (original Python sieve, legacy PFGW wrapper) |
 | `CMakeLists.txt` | CMake build (Ninja generator) for `hgfn_sieve` and `prp_test` |
 | `coverage.sh` | progress ledger: record completed blocks, generate `STATUS.md`, list the proof queue |
 | `coverage.tsv` | append-only coverage ledger (which blocks/stages/params are done) |
@@ -423,3 +443,5 @@ primes.txt
 | `STATUS.md` | human-readable coverage table (generated) |
 | `results/` | small kept results: proven primes (`primes.tsv`) and PRP survivors per block |
 | `TODO.md` | deferred ideas / roadmap |
+| `CONTRIBUTING.md` | how to contribute compute (claim/run/record) and code |
+| `githooks/pre-commit` | removes a proved block's PRP staging file on commit (enable: `git config core.hooksPath githooks`) |
