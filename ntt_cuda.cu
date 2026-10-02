@@ -486,13 +486,49 @@ static void negamul_resident(const i64* dX, const i64* dY, i64* dOut, Plan& P) {
     CUDA_OK(cudaMemcpy(dOut, P.dCoef, (size_t)N * sizeof(i64), cudaMemcpyDeviceToDevice));
 }
 
+// Checkpoint format: a small header (identifying the exact problem) + the next
+// exponent bit to process + the N i64 residue digits. Written atomically (tmp +
+// rename) so a crash mid-write cannot corrupt a good checkpoint.
+static const uint32_t CKPT_MAGIC = 0x48474E31u;   // "HGN1"
+struct CkptHdr { uint32_t magic, k, base; u64 b; int64_t nextbit; int64_t N; };
+
+static void ckpt_save(const char* path, int k, u64 b, uint32_t base,
+                      int64_t nextbit, const std::vector<i64>& res) {
+    std::string tmp = std::string(path) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) { fprintf(stderr, "ckpt: cannot write %s\n", tmp.c_str()); return; }
+    CkptHdr h{CKPT_MAGIC, (uint32_t)k, base, b, nextbit, (int64_t)res.size()};
+    fwrite(&h, sizeof(h), 1, f);
+    fwrite(res.data(), sizeof(i64), res.size(), f);
+    fclose(f);
+    remove(path); rename(tmp.c_str(), path);
+}
+static bool ckpt_load(const char* path, int k, u64 b, uint32_t base,
+                      int N, std::vector<i64>& res, int64_t& nextbit) {
+    FILE* f = fopen(path, "rb"); if (!f) return false;
+    CkptHdr h{};
+    if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != CKPT_MAGIC ||
+        h.k != (uint32_t)k || h.b != b || h.base != base || h.N != N) { fclose(f); return false; }
+    res.assign(N, 0);
+    bool ok = fread(res.data(), sizeof(i64), N, f) == (size_t)N;
+    fclose(f);
+    nextbit = h.nextbit;
+    return ok;
+}
+
 // Resident powering: res = a^E mod (b^N+1), returned as host digit vector.
-// `time_ms` (if non-null) receives the GPU powering time.
-static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E,
-                                          Plan& P, double* time_ms) {
+// `time_ms` (if non-null) receives this run's GPU powering time. If `ckpt_path`
+// is set, the residue is checkpointed every `ckpt_int` squarings and the run
+// resumes from an existing matching checkpoint. `stopat` > 0 stops early after
+// that many squarings (for testing resume); then `*stopped` is set and the
+// returned vector is empty.
+static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E, Plan& P,
+                                          double* time_ms, const char* ckpt_path,
+                                          int ckpt_int, int stopat, uint32_t base,
+                                          bool* stopped) {
     const int N = (int)P.N; const u64 b = P.b;
     const int tpb = 256, g = (N + tpb - 1) / tpb;
-    // upload acc = a (as digits) and init res = 1
+    if (stopped) *stopped = false;
     std::vector<i64> ad(N, 0);
     { mpz_t t, q; mpz_init_set(t, a_red); mpz_init(q);
       for (int j = 0; j < N; ++j) { u64 r = mpz_fdiv_q_ui(q, t, (unsigned long)b); ad[j] = (i64)r; mpz_set(t, q); }
@@ -502,15 +538,34 @@ static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E,
     CUDA_OK(cudaMalloc(&dRes, N * sizeof(i64)));
     CUDA_OK(cudaMalloc(&dTmp, N * sizeof(i64)));
     CUDA_OK(cudaMemcpy(dAcc, ad.data(), N * sizeof(i64), cudaMemcpyHostToDevice));
-    k_set_unit<<<g, tpb>>>(dRes, N);
 
     size_t bits = mpz_sizeinbase(E, 2);
+    int64_t startbit = (int64_t)bits - 1;
+    std::vector<i64> host(N);
+    if (ckpt_path && ckpt_load(ckpt_path, P.k, b, base, N, host, startbit)) {
+        CUDA_OK(cudaMemcpy(dRes, host.data(), N * sizeof(i64), cudaMemcpyHostToDevice));
+        fprintf(stderr, "ckpt: resumed at bit %lld / %zu\n", (long long)startbit, bits);
+    } else {
+        k_set_unit<<<g, tpb>>>(dRes, N);
+    }
+
+    int sqcount = 0;
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     CUDA_OK(cudaDeviceSynchronize()); cudaEventRecord(t0);
-    for (size_t i = bits; i-- > 0;) {
-        negamul_resident(dRes, dRes, dTmp, P); std::swap(dRes, dTmp);   // square
-        if (mpz_tstbit(E, (mp_bitcnt_t)i)) {
-            negamul_resident(dRes, dAcc, dTmp, P); std::swap(dRes, dTmp); // *a
+    for (int64_t i = startbit; i >= 0; --i) {
+        negamul_resident(dRes, dRes, dTmp, P); std::swap(dRes, dTmp);        // square
+        if (mpz_tstbit(E, (mp_bitcnt_t)i)) { negamul_resident(dRes, dAcc, dTmp, P); std::swap(dRes, dTmp); }
+        ++sqcount;
+        bool do_ckpt = ckpt_path && ckpt_int > 0 && (sqcount % ckpt_int == 0);
+        bool do_stop = stopat > 0 && sqcount >= stopat;
+        if (do_ckpt || do_stop) {
+            CUDA_OK(cudaMemcpy(host.data(), dRes, N * sizeof(i64), cudaMemcpyDeviceToHost));
+            ckpt_save(ckpt_path ? ckpt_path : "resume.ckpt", P.k, b, base, i - 1, host);
+            if (do_stop) {
+                cudaFree(dAcc); cudaFree(dRes); cudaFree(dTmp);
+                if (stopped) *stopped = true;
+                return {};
+            }
         }
     }
     cudaEventRecord(t1); CUDA_OK(cudaEventSynchronize(t1));
@@ -520,6 +575,7 @@ static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E,
     std::vector<i64> res(N);
     CUDA_OK(cudaMemcpy(res.data(), dRes, N * sizeof(i64), cudaMemcpyDeviceToHost));
     cudaFree(dAcc); cudaFree(dRes); cudaFree(dTmp);
+    if (ckpt_path) remove(ckpt_path);        // completed -> drop the checkpoint
     return res;
 }
 
@@ -543,6 +599,7 @@ static std::vector<i64> mpz_to_digits(const mpz_t x, u64 N, u64 b) {
 int main(int argc, char** argv) {
     int k = -1; u64 b = 0; unsigned long base_a = 3; bool selftest = false; int reps = 20;
     bool resident = false; int bench = 0;
+    const char* ckpt = nullptr; int ckpt_int = 50000, stopat = -1;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) { if (i + 1 >= argc) { fprintf(stderr, "missing arg %s\n", f); exit(2);} return argv[++i]; };
@@ -552,8 +609,12 @@ int main(int argc, char** argv) {
         else if (s == "--selftest") selftest = true;
         else if (s == "--resident") resident = true;
         else if (s == "--bench") bench = atoi(nx("--bench"));
+        else if (s == "--ckpt") ckpt = nx("--ckpt");
+        else if (s == "--ckpt-int") ckpt_int = atoi(nx("--ckpt-int"));
+        else if (s == "--stopat") stopat = atoi(nx("--stopat"));
         else if (s == "--n") reps = atoi(nx("--n"));
-        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--resident] [--selftest --n R] [--bench S]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--resident [--ckpt FILE --ckpt-int N]] "
+                               "[--selftest --n R] [--bench S]\n", argv[0]); return 2; }
     }
     if (k < 1 || b < 3 || (b % 2) == 0) { fprintf(stderr, "Need --k>=1 and odd --b>=3.\n"); return 2; }
 
@@ -622,7 +683,14 @@ int main(int argc, char** argv) {
     std::vector<i64> res;
     double tms = 0;
     if (resident) {
-        res = powering_resident(a_red, Emo, P, &tms);
+        bool stopped = false;
+        res = powering_resident(a_red, Emo, P, &tms, ckpt, ckpt_int, stopat, (uint32_t)base_a, &stopped);
+        if (stopped) {
+            printf("  stopped after %d squarings; checkpoint written%s\n", stopat,
+                   ckpt ? "" : " (resume.ckpt)");
+            mpz_clear(a_red); mpz_clears(BN1, M, a_mpz, ref, got, Emo, nullptr);
+            return 0;
+        }
     } else {
         std::vector<i64> acc = mpz_to_digits(a_red, N, b);
         res.assign(N, 0); res[0] = 1;
