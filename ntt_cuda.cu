@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <random>
+#include <chrono>
 #include <gmp.h>
 #include <cuda_runtime.h>
 
@@ -58,12 +59,24 @@ static i64 mpz_to_i64(const mpz_t x) {           // 32-bit-safe on Windows LLP64
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ u64 d_mulmod(u64 a, u64 b, u64 p) { return (a * b) % p; }
 
-// Weight x_j (already reduced to [0,p)) by psi^j, in natural order.
+// Montgomery arithmetic, R = 2^32 (primes < 2^31). Values are held as a*R mod p;
+// n0 = -p^{-1} mod 2^32. REDC(T), T < p*2^32, returns T*R^-1 mod p.
+__device__ __forceinline__ u64 mont_redc(u64 T, u64 p, uint32_t n0) {
+    uint32_t m = (uint32_t)T * n0;              // mod 2^32
+    u64 t = (T + (u64)m * p) >> 32;             // T + m*p < 2^64
+    return (t >= p) ? t - p : t;
+}
+__device__ __forceinline__ u64 mont_mul(u64 a, u64 b, u64 p, uint32_t n0) {
+    return mont_redc(a * b, p, n0);             // a,b < p < 2^31 -> a*b < 2^62
+}
+
+// Weight x_j (already reduced to [0,p)) by psi^j, converting into the Montgomery
+// domain. wj holds psi^j in Montgomery form; R2 = 2^64 mod p converts x in.
 __global__ void k_weight(const u64* __restrict__ xmod, const u64* __restrict__ wj,
-                         u64* __restrict__ A, int N, u64 p) {
+                         u64* __restrict__ A, int N, u64 p, uint32_t n0, u64 R2) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= N) return;
-    A[j] = d_mulmod(xmod[j], wj[j], p);
+    A[j] = mont_mul(mont_mul(xmod[j], R2, p, n0), wj[j], p, n0);
 }
 
 // Bit-reversal permutation: dst[j] = src[rev[j]]  (position j gets src[bitrev(j)]).
@@ -73,10 +86,10 @@ __global__ void k_bitperm(const u64* __restrict__ src, u64* __restrict__ dst,
     if (j < N) dst[j] = src[rev[j]];
 }
 
-// One in-place radix-2 DIT stage. W is the twiddle table (omega^t, t=0..N-1);
-// the twiddle for position t at this stage is W[stride*t], stride = N/len.
+// One in-place radix-2 DIT stage (Montgomery domain). W holds twiddles omega^t in
+// Montgomery form; the twiddle for position t at this stage is W[stride*t].
 __global__ void k_stage(u64* __restrict__ A, const u64* __restrict__ W,
-                        int N, u64 p, int stride, int half, int len) {
+                        int N, u64 p, uint32_t n0, int stride, int half, int len) {
     int bid = blockIdx.x * blockDim.x + threadIdx.x;
     if (bid >= N / 2) return;
     int block = bid / half;
@@ -84,28 +97,45 @@ __global__ void k_stage(u64* __restrict__ A, const u64* __restrict__ W,
     int i = block * len + t;
     u64 w = W[stride * t];
     u64 u = A[i];
-    u64 v = d_mulmod(A[i + half], w, p);
+    u64 v = mont_mul(A[i + half], w, p, n0);
     A[i]        = (u + v) % p;
     A[i + half] = (u + p - v) % p;
 }
 
-__global__ void k_pointwise_sq(u64* __restrict__ C, const u64* __restrict__ A,
-                               int N, u64 p) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < N) C[j] = d_mulmod(A[j], A[j], p);
-}
-__global__ void k_pointwise_mul(u64* __restrict__ C, const u64* __restrict__ A,
-                                const u64* __restrict__ B, int N, u64 p) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < N) C[j] = d_mulmod(A[j], B[j], p);
+// Forward radix-2 DIF stage (Montgomery): natural-order in, bit-reversed out, so
+// no separate bit-reversal permutation is needed. Stages run len = N down to 2.
+__global__ void k_stage_dif(u64* __restrict__ A, const u64* __restrict__ W,
+                            int N, u64 p, uint32_t n0, int stride, int half, int len) {
+    int bid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bid >= N / 2) return;
+    int block = bid / half;
+    int t = bid % half;
+    int i = block * len + t;
+    u64 u = A[i], v = A[i + half];
+    A[i]        = (u + v) % p;
+    A[i + half] = mont_mul((u + p - v) % p, W[stride * t], p, n0);
 }
 
-// After inverse transform: scale by N^-1 and unweight by psi^-j.
+__global__ void k_pointwise_sq(u64* __restrict__ C, const u64* __restrict__ A,
+                               int N, u64 p, uint32_t n0) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < N) C[j] = mont_mul(A[j], A[j], p, n0);
+}
+__global__ void k_pointwise_mul(u64* __restrict__ C, const u64* __restrict__ A,
+                                const u64* __restrict__ B, int N, u64 p, uint32_t n0) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < N) C[j] = mont_mul(A[j], B[j], p, n0);
+}
+
+// After inverse transform: scale by N^-1, unweight by psi^-j, convert OUT of
+// Montgomery to a plain residue in [0,p) for the CRT.
 __global__ void k_unweight(u64* __restrict__ C, const u64* __restrict__ wij,
-                           int N, u64 p, u64 ninv) {
+                           int N, u64 p, uint32_t n0, u64 ninv_mont) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= N) return;
-    C[j] = d_mulmod(d_mulmod(C[j], ninv, p), wij[j], p);
+    u64 v = mont_mul(C[j], ninv_mont, p, n0);
+    v = mont_mul(v, wij[j], p, n0);
+    C[j] = mont_redc(v, p, n0);                 // Montgomery -> plain
 }
 
 // ===========================================================================
@@ -113,13 +143,13 @@ __global__ void k_unweight(u64* __restrict__ C, const u64* __restrict__ wij,
 // powering loop stays on the device (no host round-trip per squaring).
 // ===========================================================================
 
-// Weight an i64 digit vector (balanced, possibly negative) by psi^j.
+// Weight an i64 digit vector (balanced, possibly negative) by psi^j, into Montgomery.
 __global__ void k_weight_i64(const i64* __restrict__ x, const u64* __restrict__ wj,
-                             u64* __restrict__ A, int N, u64 p) {
+                             u64* __restrict__ A, int N, u64 p, uint32_t n0, u64 R2) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= N) return;
     i64 r = x[j] % (i64)p; if (r < 0) r += (i64)p;
-    A[j] = d_mulmod((u64)r, wj[j], p);
+    A[j] = mont_mul(mont_mul((u64)r, R2, p, n0), wj[j], p, n0);
 }
 
 // Balanced multi-prime CRT per coefficient, pure 64-bit (nvcc has no __int128 on
@@ -187,6 +217,9 @@ __global__ void k_any_nonzero(const i64* __restrict__ hi, int N, int* __restrict
 // ---------------------------------------------------------------------------
 struct PrimePlan {
     u64 p, psi, psi_inv, omega, omega_inv, ninv;
+    uint32_t n0;            // -p^-1 mod 2^32  (Montgomery)
+    u64 R2;                 // 2^64 mod p      (Montgomery convert-in)
+    u64 ninv_mont;          // ninv in Montgomery form
     u64 *dW = nullptr, *dWinv = nullptr;   // twiddle tables (device)
     u64 *dWj = nullptr, *dWij = nullptr;   // weight tables psi^j, psi^-j (device)
     int *dRev = nullptr;                    // bit-reversal permutation (device)
@@ -221,6 +254,18 @@ static u64 find_psi(u64 p, u64 N) {
 
 static int bitrev(int x, int bits) { int r = 0; for (int i = 0; i < bits; ++i) { r = (r << 1) | (x & 1); x >>= 1; } return r; }
 
+// Montgomery setup for an odd prime p < 2^31, R = 2^32.
+static uint32_t mont_n0(u64 p) {                 // -p^-1 mod 2^32 (Newton)
+    uint32_t inv = 1;
+    for (int i = 0; i < 5; ++i) inv *= (uint32_t)(2 - (uint32_t)p * inv);
+    return (uint32_t)(0u - inv);
+}
+static u64 mont_R2(u64 p) {                        // 2^64 mod p
+    u64 Rmod = ((unsigned long long)1 << 32) % p;  // 2^32 mod p
+    return h_mulmod(Rmod, Rmod, p);
+}
+static inline u64 to_mont(u64 x, u64 p) { return h_mulmod(x, ((unsigned long long)1 << 32) % p, p); }
+
 static Plan make_plan(int k, u64 b) {
     Plan P; P.k = k; P.N = (u64)1 << k; P.b = b;
     const u64 N = P.N;
@@ -245,13 +290,16 @@ static Plan make_plan(int k, u64 b) {
         pp.psi = find_psi(q, N); pp.psi_inv = h_modinv(pp.psi, q);
         pp.omega = h_mulmod(pp.psi, pp.psi, q); pp.omega_inv = h_modinv(pp.omega, q);
         pp.ninv = h_modinv(N % q, q);
+        pp.n0 = mont_n0(q); pp.R2 = mont_R2(q);
+        pp.ninv_mont = to_mont(pp.ninv, q);
+        // twiddle / weight tables, stored in Montgomery form (value * 2^32 mod p)
         std::vector<u64> W(N), Winv(N), Wj(N), Wij(N);
-        W[0] = Winv[0] = Wj[0] = Wij[0] = 1;
-        for (u64 j = 1; j < N; ++j) {
-            W[j]    = h_mulmod(W[j - 1], pp.omega, q);
-            Winv[j] = h_mulmod(Winv[j - 1], pp.omega_inv, q);
-            Wj[j]   = h_mulmod(Wj[j - 1], pp.psi, q);
-            Wij[j]  = h_mulmod(Wij[j - 1], pp.psi_inv, q);
+        u64 w = 1, wi = 1, wj = 1, wij = 1;        // plain running powers
+        for (u64 j = 0; j < N; ++j) {
+            W[j] = to_mont(w, q); Winv[j] = to_mont(wi, q);
+            Wj[j] = to_mont(wj, q); Wij[j] = to_mont(wij, q);
+            w = h_mulmod(w, pp.omega, q);    wi  = h_mulmod(wi,  pp.omega_inv, q);
+            wj = h_mulmod(wj, pp.psi, q);    wij = h_mulmod(wij, pp.psi_inv, q);
         }
         size_t nb = N * sizeof(u64);
         CUDA_OK(cudaMalloc(&pp.dW, nb));   CUDA_OK(cudaMemcpy(pp.dW, W.data(), nb, cudaMemcpyHostToDevice));
@@ -290,18 +338,23 @@ static Plan make_plan(int k, u64 b) {
     return P;
 }
 
-// forward/inverse NTT on device buffer `dBuf`, in natural order in and out.
-// Mirrors the CPU reference: bit-reverse permute first, then the DIT stages.
+// NTT on device buffer `dBuf` in place. Forward uses DIF (natural -> bit-reversed),
+// inverse uses DIT (bit-reversed -> natural), so the pair round-trips to natural
+// order with NO explicit bit-reversal and NO extra buffer copy. The pointwise step
+// in between operates on bit-reversed data, which is fine (it is elementwise).
 static void ntt_device(u64* dBuf, const PrimePlan& pp, int N, bool inverse, int tpb) {
-    const u64* Wtab = inverse ? pp.dWinv : pp.dW;
-    int gN = (N + tpb - 1) / tpb;
-    k_bitperm<<<gN, tpb>>>(dBuf, pp.dP, pp.dRev, N);   // dP = bitrev(dBuf)
-    for (int len = 2; len <= N; len <<= 1) {
-        int half = len / 2, stride = N / len;
-        int blocks = (N / 2 + tpb - 1) / tpb;
-        k_stage<<<blocks, tpb>>>(pp.dP, Wtab, N, pp.p, stride, half, len);
+    int blocks = (N / 2 + tpb - 1) / tpb;
+    if (!inverse) {
+        for (int len = N; len >= 2; len >>= 1) {
+            int half = len / 2, stride = N / len;
+            k_stage_dif<<<blocks, tpb>>>(dBuf, pp.dW, N, pp.p, pp.n0, stride, half, len);
+        }
+    } else {
+        for (int len = 2; len <= N; len <<= 1) {
+            int half = len / 2, stride = N / len;
+            k_stage<<<blocks, tpb>>>(dBuf, pp.dWinv, N, pp.p, pp.n0, stride, half, len);
+        }
     }
-    CUDA_OK(cudaMemcpy(dBuf, pp.dP, (size_t)N * sizeof(u64), cudaMemcpyDeviceToDevice));
 }
 
 // Negacyclic multiply/square of signed digit vectors x,y (base b) -> signed
@@ -322,19 +375,19 @@ static std::vector<i64> negamul_gpu(const std::vector<i64>& x,
         auto to_mod = [p](i64 d) -> u64 { i64 r = d % (i64)p; if (r < 0) r += (i64)p; return (u64)r; };
         for (int j = 0; j < N; ++j) hx[j] = to_mod(x[j]);
         CUDA_OK(cudaMemcpy(pp.dX, hx.data(), N * sizeof(u64), cudaMemcpyHostToDevice));
-        k_weight<<<gridN, tpb>>>(pp.dX, pp.dWj, pp.dA, N, p);
+        k_weight<<<gridN, tpb>>>(pp.dX, pp.dWj, pp.dA, N, p, pp.n0, pp.R2);
         ntt_device(pp.dA, pp, N, false, tpb);
         if (squaring) {
-            k_pointwise_sq<<<gridN, tpb>>>(pp.dC, pp.dA, N, p);
+            k_pointwise_sq<<<gridN, tpb>>>(pp.dC, pp.dA, N, p, pp.n0);
         } else {
             for (int j = 0; j < N; ++j) hy[j] = to_mod(y[j]);
             CUDA_OK(cudaMemcpy(pp.dX, hy.data(), N * sizeof(u64), cudaMemcpyHostToDevice));
-            k_weight<<<gridN, tpb>>>(pp.dX, pp.dWj, pp.dB, N, p);
+            k_weight<<<gridN, tpb>>>(pp.dX, pp.dWj, pp.dB, N, p, pp.n0, pp.R2);
             ntt_device(pp.dB, pp, N, false, tpb);
-            k_pointwise_mul<<<gridN, tpb>>>(pp.dC, pp.dA, pp.dB, N, p);
+            k_pointwise_mul<<<gridN, tpb>>>(pp.dC, pp.dA, pp.dB, N, p, pp.n0);
         }
         ntt_device(pp.dC, pp, N, true, tpb);
-        k_unweight<<<gridN, tpb>>>(pp.dC, pp.dWij, N, p, pp.ninv);
+        k_unweight<<<gridN, tpb>>>(pp.dC, pp.dWij, N, p, pp.n0, pp.ninv_mont);
         CUDA_OK(cudaGetLastError());
         CUDA_OK(cudaMemcpy(hc.data(), pp.dC, N * sizeof(u64), cudaMemcpyDeviceToHost));
         for (int j = 0; j < N; ++j) cres[(size_t)j][pi] = hc[j];
@@ -400,17 +453,17 @@ static void negamul_resident(const i64* dX, const i64* dY, i64* dOut, Plan& P) {
     (void)gh;
     for (int pi = 0; pi < m; ++pi) {
         PrimePlan& pp = P.pp[pi]; u64 p = pp.p;
-        k_weight_i64<<<g, tpb>>>(dX, pp.dWj, pp.dA, N, p);
+        k_weight_i64<<<g, tpb>>>(dX, pp.dWj, pp.dA, N, p, pp.n0, pp.R2);
         ntt_device(pp.dA, pp, N, false, tpb);
         if (squaring) {
-            k_pointwise_sq<<<g, tpb>>>(pp.dC, pp.dA, N, p);
+            k_pointwise_sq<<<g, tpb>>>(pp.dC, pp.dA, N, p, pp.n0);
         } else {
-            k_weight_i64<<<g, tpb>>>(dY, pp.dWj, pp.dB, N, p);
+            k_weight_i64<<<g, tpb>>>(dY, pp.dWj, pp.dB, N, p, pp.n0, pp.R2);
             ntt_device(pp.dB, pp, N, false, tpb);
-            k_pointwise_mul<<<g, tpb>>>(pp.dC, pp.dA, pp.dB, N, p);
+            k_pointwise_mul<<<g, tpb>>>(pp.dC, pp.dA, pp.dB, N, p, pp.n0);
         }
         ntt_device(pp.dC, pp, N, true, tpb);
-        k_unweight<<<g, tpb>>>(pp.dC, pp.dWij, N, p, pp.ninv);
+        k_unweight<<<g, tpb>>>(pp.dC, pp.dWij, N, p, pp.n0, pp.ninv_mont);
     }
     k_crt<<<g, tpb>>>(P.dCptrs, P.dPrimes, P.dGinv, m, P.dCoef, N);
     // parallel balanced carry: iterate until no carry remains. Each pass moves
@@ -489,7 +542,7 @@ static std::vector<i64> mpz_to_digits(const mpz_t x, u64 N, u64 b) {
 
 int main(int argc, char** argv) {
     int k = -1; u64 b = 0; unsigned long base_a = 3; bool selftest = false; int reps = 20;
-    bool resident = false;
+    bool resident = false; int bench = 0;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) { if (i + 1 >= argc) { fprintf(stderr, "missing arg %s\n", f); exit(2);} return argv[++i]; };
@@ -498,8 +551,9 @@ int main(int argc, char** argv) {
         else if (s == "--base") base_a = strtoul(nx("--base"), nullptr, 10);
         else if (s == "--selftest") selftest = true;
         else if (s == "--resident") resident = true;
+        else if (s == "--bench") bench = atoi(nx("--bench"));
         else if (s == "--n") reps = atoi(nx("--n"));
-        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--resident] [--selftest --n R]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--resident] [--selftest --n R] [--bench S]\n", argv[0]); return 2; }
     }
     if (k < 1 || b < 3 || (b % 2) == 0) { fprintf(stderr, "Need --k>=1 and odd --b>=3.\n"); return 2; }
 
@@ -530,6 +584,36 @@ int main(int argc, char** argv) {
         mpz_clears(X, Y, Z, Zr, nullptr);
         printf("selftest: %d reps x2 ops -> %s\n", reps, fails == 0 ? "ALL OK" : "FAILURES");
         return fails == 0 ? 0 : 1;
+    }
+
+    if (bench > 0) {
+        // GPU: time `bench` resident squarings of a random residue
+        const int Ni = (int)N, tpb = 256, g = (Ni + tpb - 1) / tpb;
+        std::vector<i64> rd(Ni); std::mt19937_64 rng(99);
+        for (int j = 0; j < Ni; ++j) rd[j] = (i64)(rng() % b);
+        i64 *dR, *dT; CUDA_OK(cudaMalloc(&dR, Ni * sizeof(i64))); CUDA_OK(cudaMalloc(&dT, Ni * sizeof(i64)));
+        CUDA_OK(cudaMemcpy(dR, rd.data(), Ni * sizeof(i64), cudaMemcpyHostToDevice));
+        negamul_resident(dR, dR, dT, P); std::swap(dR, dT);          // warm-up
+        cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+        CUDA_OK(cudaDeviceSynchronize()); cudaEventRecord(t0);
+        for (int s = 0; s < bench; ++s) { negamul_resident(dR, dR, dT, P); std::swap(dR, dT); }
+        cudaEventRecord(t1); CUDA_OK(cudaEventSynchronize(t1));
+        float gms = 0; cudaEventElapsedTime(&gms, t0, t1);
+        cudaFree(dR); cudaFree(dT); (void)g;
+
+        // CPU: time `bench` single-core GMP squarings mod M
+        mpz_t r; mpz_init(r); gmp_randstate_t st; gmp_randinit_default(st);
+        mpz_urandomm(r, st, M);
+        auto c0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < bench; ++s) { mpz_mul(r, r, r); mpz_mod(r, r, M); }
+        auto c1 = std::chrono::steady_clock::now();
+        double cms = std::chrono::duration<double, std::milli>(c1 - c0).count();
+        mpz_clear(r); gmp_randclear(st);
+
+        printf("  bench %d squarings:  GPU %.4f ms/sq   CPU(1 core GMP) %.4f ms/sq   speedup %.2fx\n",
+               bench, gms / bench, cms / bench, (cms / bench) / (gms / bench));
+        mpz_clears(BN1, M, a_mpz, ref, got, Emo, nullptr);
+        return 0;
     }
 
     mpz_sub_ui(Emo, M, 1);
