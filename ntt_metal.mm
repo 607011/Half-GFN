@@ -33,6 +33,7 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 using i128 = __int128;          // host coefficient path (Apple Silicon native)
+using u128 = unsigned __int128;
 
 // ---------------------------------------------------------------------------
 // Host-side modular helpers (plain u64; these are setup/reference, not hot path)
@@ -526,59 +527,58 @@ static std::vector<u32> ntt_primes_bound(u64 N, u64 b) {
     return out;
 }
 
-// Extract a signed 128-bit value from an mpz (little-endian 32-bit chunks, so it
-// is independent of the platform's `long` width). |coeff| <= N*(b-1)^2 fits in
-// i128 for every realistic k/b (e.g. k=18, b~10^7 -> ~10^19 << 2^127).
-static i128 mpz_to_i128(const mpz_t x) {
-    int neg = mpz_sgn(x) < 0;
-    mpz_t t; mpz_init(t); mpz_abs(t, x);
-    unsigned __int128 v = 0;
-    for (int sh = 0; sh < 128 && mpz_sgn(t) != 0; sh += 32) {
-        uint32_t limb = (uint32_t)mpz_get_ui(t);
-        v |= ((unsigned __int128)limb) << sh;
-        mpz_fdiv_q_2exp(t, t, 32);
+// Precomputed, prime-set-constant data for the integer Garner CRT (built once,
+// since the primes never change): ginv[i] = (p0*...*p_{i-1})^{-1} mod p_i, the
+// full product Pprod, and its half for balancing.
+struct CrtPlan {
+    std::vector<u64> ginv;   // ginv[0] unused
+    u128 Pprod = 1, half = 0;
+};
+static CrtPlan make_crt_plan(const std::vector<u32>& primes) {
+    CrtPlan cp; cp.ginv.resize(primes.size(), 0);
+    u128 Macc = primes[0];
+    for (size_t i = 1; i < primes.size(); ++i) {
+        u64 pi = primes[i];
+        cp.ginv[i] = modinv((u64)(Macc % pi), pi);
+        Macc *= (u128)pi;
     }
-    mpz_clear(t);
-    return neg ? -(i128)v : (i128)v;
+    cp.Pprod = Macc; cp.half = Macc >> 1;
+    return cp;
 }
 
-// Balanced CRT of residues r[i] mod primes[i] -> signed coefficient (mpz Garner).
-static i128 crt_balanced(const std::vector<u32>& r, const std::vector<u32>& primes) {
+// Balanced CRT of residues r[i] mod primes[i] -> signed coefficient, pure integer
+// (no mpz, no per-call modinv -- this runs once per coefficient, N times per
+// squaring). u128 accumulator; fits for up to ~4 of our (< 2^31) primes.
+static inline i128 crt_balanced(const std::vector<u32>& r, const std::vector<u32>& primes,
+                                const CrtPlan& cp) {
     const size_t m = primes.size();
-    mpz_t x, Macc, t, P_, half;
-    mpz_init_set_ui(x, r[0] % primes[0]);
-    mpz_init_set_ui(Macc, primes[0]);
-    mpz_init(t);
+    u128 x = r[0] % primes[0];
+    u128 Macc = primes[0];
     for (size_t i = 1; i < m; ++i) {
         u64 pi = primes[i];
-        u64 xmod = mpz_fdiv_ui(x, (unsigned long)pi);
-        u64 inv = modinv(mpz_fdiv_ui(Macc, (unsigned long)pi), pi);
+        u64 xmod = (u64)(x % pi);
         i64 dd = (i64)(r[i] % pi) - (i64)xmod;
         dd %= (i64)pi; if (dd < 0) dd += (i64)pi;
-        u64 tt = mulmod((u64)dd, inv, pi);
-        mpz_mul_ui(t, Macc, (unsigned long)tt);
-        mpz_add(x, x, t);
-        mpz_mul_ui(Macc, Macc, (unsigned long)pi);
+        u64 tt = mulmod((u64)dd, cp.ginv[i], pi);
+        x += Macc * (u128)tt;
+        Macc *= (u128)pi;
     }
-    mpz_init(P_); mpz_set(P_, Macc);
-    mpz_init(half); mpz_fdiv_q_ui(half, P_, 2);
-    if (mpz_cmp(x, half) > 0) mpz_sub(x, x, P_);
-    i128 out = mpz_to_i128(x);
-    mpz_clear(x); mpz_clear(Macc); mpz_clear(t); mpz_clear(P_); mpz_clear(half);
-    return out;
+    return (x > cp.half) ? (i128)(x - cp.Pprod) : (i128)x;
 }
 
-// Balanced base-b carry with the b^N = -1 wrap. Coefficients arrive as i128
-// (they can exceed i64); the resulting digits are in (-b/2, b/2] and fit i64.
-static std::vector<i64> carry_balanced(const std::vector<i128>& c, u64 b) {
-    const i128 bb = (i128)b, half = bb / 2;
-    std::vector<i128> d = c;
+// Balanced base-b carry with the b^N = -1 wrap. Coefficients arrive as T (i64
+// when 2 primes suffice, i128 otherwise); the resulting digits are in (-b/2, b/2]
+// and fit i64.
+template <class T>
+static std::vector<i64> carry_balanced(const std::vector<T>& c, u64 b) {
+    const T bb = (T)b, half = bb / 2;
+    std::vector<T> d = c;
     const u64 N = d.size();
     for (int guard = 0; guard < 128; ++guard) {
-        i128 carry = 0;
+        T carry = 0;
         for (u64 j = 0; j < N; ++j) {
-            i128 v = d[j] + carry;
-            i128 rem = v % bb; if (rem < 0) rem += bb;
+            T v = d[j] + carry;
+            T rem = v % bb; if (rem < 0) rem += bb;
             if (rem > half) rem -= bb;
             carry = (v - rem) / bb;
             d[j] = rem;
@@ -637,6 +637,8 @@ struct Engine {
     std::vector<PrimeGPU> G;
     id<MTLBuffer> bInX, bInY, bW, bFx, bFy, bT;
     u32 ln = 0, nn = 0;
+    CrtPlan crt;                    // precomputed Garner constants (primes fixed)
+    double t_gpu = 0, t_cpu = 0;    // profiling accumulators (GPU work vs CPU post)
 
     bool init(int k_, u64 b_) {
         k = k_; N = (u64)1 << k_; b = b_; ln = (u32)k_; nn = (u32)N;
@@ -687,6 +689,7 @@ struct Engine {
         bW = mkbuf(nullptr, N * 4);
         bFx = mkbuf(nullptr, N * 4); bFy = mkbuf(nullptr, N * 4);
         bT = mkbuf(nullptr, N * 4);
+        crt = make_crt_plan(primes);
         return true;
     }
 
@@ -762,19 +765,40 @@ struct Engine {
                     [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
                     [e setBytes:&ninv length:4 atIndex:4];
                 });
+                auto tg = std::chrono::steady_clock::now();
                 [cb commit]; [cb waitUntilCompleted];
+                t_gpu += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - tg).count();
                 if (cb.error) { fprintf(stderr, "GPU error: %s\n",
                                cb.error.localizedDescription.UTF8String); exit(2); }
                 memcpy(cres[pi].data(), bT.contents, N * 4);
                 cb = [q commandBuffer];
             }
-            std::vector<i128> c(N);
-            std::vector<u32> col(primes.size());
-            for (u64 j = 0; j < N; ++j) {
-                for (size_t pi = 0; pi < primes.size(); ++pi) col[pi] = cres[pi][j];
-                c[j] = crt_balanced(col, primes);
+            auto tc = std::chrono::steady_clock::now();
+            if (primes.size() == 2) {
+                // fast all-u64 path: p0*p1 < 2^62, no u128 anywhere
+                const u64 p0 = primes[0], p1 = primes[1], P = p0 * p1, inv = crt.ginv[1];
+                const i64 Phalf = (i64)(P >> 1);
+                const u32 *c0 = cres[0].data(), *c1 = cres[1].data();
+                std::vector<i64> c(N);
+                for (u64 j = 0; j < N; ++j) {
+                    u64 r0 = c0[j];
+                    i64 d = (i64)c1[j] - (i64)(r0 % p1); d %= (i64)p1; if (d < 0) d += (i64)p1;
+                    u64 v = r0 + p0 * mulmod((u64)d, inv, p1);
+                    c[j] = ((i64)v > Phalf) ? (i64)v - (i64)P : (i64)v;
+                }
+                result = carry_balanced<i64>(c, b);
+            } else {
+                std::vector<i128> c(N);
+                std::vector<u32> col(primes.size());
+                for (u64 j = 0; j < N; ++j) {
+                    for (size_t pi = 0; pi < primes.size(); ++pi) col[pi] = cres[pi][j];
+                    c[j] = crt_balanced(col, primes, crt);
+                }
+                result = carry_balanced<i128>(c, b);
             }
-            result = carry_balanced(c, b);
+            t_cpu += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - tc).count();
         }
         return result;
     }
@@ -866,13 +890,57 @@ static int selftest_prp(int k, u64 b, unsigned long base_a) {
     return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: milliseconds per squaring, GPU engine vs one GMP core (same metric
+// the CUDA side reports). Isolates engine throughput from the PRP length.
+// ---------------------------------------------------------------------------
+static int selftest_bench(int k, u64 b, int iters) {
+    Engine eng;
+    if (!eng.init(k, b)) return 2;
+    const u64 N = eng.N;
+
+    std::mt19937 rng(0xBEEF ^ (unsigned)k ^ (unsigned)b);
+    std::vector<i64> x(N);
+    for (u64 j = 0; j < N; ++j) x[j] = rng() % (u32)b;
+
+    // GPU: iters back-to-back squarings.
+    std::vector<i64> r = x;
+    r = eng.negamul(r, r, true);                 // warm up
+    eng.t_gpu = 0; eng.t_cpu = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) r = eng.negamul(r, r, true);
+    double gpu_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count() / iters;
+    double gpu_part = eng.t_gpu / iters, cpu_part = eng.t_cpu / iters;
+
+    // CPU: iters squarings mod (b^N+1) with GMP on one core.
+    mpz_t BN1, X, Z; mpz_inits(BN1, X, Z, nullptr);
+    mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
+    digits_to_mpz(X, x, b); mpz_mod(X, X, BN1);
+    mpz_mul(Z, X, X); mpz_mod(Z, Z, BN1);        // warm up
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) { mpz_mul(Z, X, X); mpz_mod(X, Z, BN1); }
+    double cpu_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t1).count() / iters;
+    mpz_clears(BN1, X, Z, nullptr);
+
+    printf("Metal device: %s\n", eng.dev.name.UTF8String);
+    printf("bench: k=%d N=%llu b=%llu  %zu NTT primes  %d iters\n",
+           k, (unsigned long long)N, (unsigned long long)b, eng.primes.size(), iters);
+    printf("  GPU %.3f ms/sq   CPU/GMP(1 core) %.3f ms/sq   speedup %.2fx\n",
+           gpu_ms, cpu_ms, cpu_ms / gpu_ms);
+    printf("  [breakdown] GPU dispatch+wait %.3f ms   CPU CRT+carry %.3f ms\n",
+           gpu_part, cpu_part);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int k = 16;
     u64 b = 10001;
     int reps = 8;
     unsigned long base_a = 3;
     std::string mode;
-    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp} [--k K] [--b B] [--base A] [--reps R]\n";
+    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp|bench} [--k K] [--b B] [--base A] [--reps R]\n";
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) {
@@ -890,6 +958,7 @@ int main(int argc, char** argv) {
     if (mode == "ntt")      return selftest_ntt(k);
     if (mode == "negamul")  return selftest_negamul(k, b, reps);
     if (mode == "prp")      return selftest_prp(k, b, base_a);
+    if (mode == "bench")    return selftest_bench(k, b, reps);
     fprintf(stderr, usage, argv[0]);
     return 2;
 }

@@ -62,3 +62,56 @@ beating the CPU; keep it only as a correctness oracle / medium-k convenience. Th
 large-k target (k ≥ 16, numbers of ~10^5–10^6 digits) requires a different
 paradigm: one big squaring spread across the whole GPU via FFT/NTT. See
 [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md).
+
+---
+
+## 2026-10-02 — `ntt_metal` large-k NTT engine vs. CPU (GMP), Apple Silicon
+
+**Question.** Does the integer-NTT large-k engine (`ntt_metal.mm`, one squaring
+spread across the whole GPU) beat the CPU per modular squaring, and where is the
+crossover k?
+
+**Hardware.** Apple M2 Pro (10-core GPU, unified memory). CPU baseline is one
+GMP core (a single strong-PRP squaring does not parallelise across cores).
+
+**Build.** `clang++ -O3 -ObjC++ -fobjc-arc`, GMP via Homebrew, integer NTT with
+2 primes (b=101), 32-bit Montgomery modmul, CPU-side CRT + carry over unified
+memory. Metric: milliseconds per modular squaring mod (b^N+1) (`--selftest bench`).
+
+| k | N = 2^k | GPU ms/sq | CPU ms/sq | speedup | GPU dispatch | CPU CRT+carry |
+|---|--------:|----------:|----------:|:-------:|-------------:|--------------:|
+| 13 |   8 192 | 1.24 | 0.20  | 0.16× | — | — |
+| 14 |  16 384 | 1.22 | 0.51  | 0.42× | — | — |
+| 15 |  32 768 | 1.51 | 1.13  | 0.75× | — | — |
+| 16 |  65 536 | 2.52 | 2.71  | **1.08×** | 1.05 ms | 1.25 ms |
+| 17 | 131 072 | 4.05 | 5.70  | **1.41×** | 1.31 ms | 2.47 ms |
+| 18 | 262 144 | 7.34 | 12.08 | **1.65×** | — | — |
+
+**Result.** Crossover at **k = 16** on the M2 Pro (one k later than the RTX 4060's
+k = 15, as expected for an integrated vs. a discrete GPU), scaling to 1.65× at
+k = 18. The GPU dispatch time stays nearly flat with k (0.7 → 1.3 ms), exactly the
+NTT signature; the CPU/GMP curve rises steeply (0.2 → 12 ms). Correctness is exact
+(residue + verdict match GMP; see `--selftest prp`/`negamul`).
+
+**What moved the needle.** The first working engine was 65–470× *slower*, and
+profiling (not guessing) showed 74–94% of the time was CPU post-processing, not
+the GPU: the CRT reconstruction used mpz Garner **per coefficient**, with a
+`modinv` per coefficient. Three fixes, each measured:
+- mpz Garner -> pure integer (`__int128`) CRT: ~3× on the CPU part;
+- precompute the (prime-set-constant) Garner inverses once, not per coefficient: ~2× more;
+- 2-prime fast path in all-`u64` (p0·p1 < 2^62, no 128-bit division): crossover.
+
+The GPU transform itself was competitive from the start; the lesson was that on
+unified memory the CPU post-processing is the thing to watch.
+
+**Still open.** Four-step/threadgroup tiling (fewer global passes) and batching the
+primes into one command buffer would cut the GPU part further and likely lower the
+crossover k; Gerbicz–Li + checkpoint are required before trusting long large-k runs.
+
+**Reproduce.**
+```bash
+clang++ -std=c++17 -O3 -ObjC++ -fobjc-arc ntt_metal.mm \
+  -I$(brew --prefix gmp)/include -L$(brew --prefix gmp)/lib -lgmp \
+  -framework Metal -framework Foundation -o ntt_metal
+for k in 13 14 15 16 17 18; do ./ntt_metal --selftest bench --k $k --b 101 --reps 40; done
+```
