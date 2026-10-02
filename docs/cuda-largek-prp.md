@@ -6,11 +6,12 @@ digits. The existing `prp_cuda.cu` (one thread per candidate) is a medium-k
 prototype and loses to the CPU at every size (see [`../BENCHMARKS.md`](../BENCHMARKS.md));
 this is a separate engine, not an evolution of that kernel.
 
-Status: **implemented and working** in `ntt_cuda.cu` (stages 1–3, Montgomery, and
-checkpoint/resume done; benchmarked). The GPU beats a single CPU core from **k = 17**
-up (see [`../BENCHMARKS.md`](../BENCHMARKS.md)). Remaining: a multi-stage
-shared-memory NTT to lower the crossover, and Gerbicz–Li error checking. The stage
-checklist in §7 marks what is done.
+Status: **implemented and working** in `ntt_cuda.cu` (stages 1–3, Montgomery,
+multi-stage shared-memory NTT, sync-free carry, and checkpoint/resume all done;
+benchmarked). The GPU beats a single CPU core from **k = 15** up — covering the whole
+k ≥ 16 target range (k=16 by 2.3×, k=18 by ~6×; see
+[`../BENCHMARKS.md`](../BENCHMARKS.md)). Remaining: Gerbicz–Li error checking and
+pipeline integration. The stage checklist in §7 marks what is done.
 
 ---
 
@@ -174,26 +175,23 @@ residue. Required, not optional:
    checkpoint/resume **[done]**, bit-exact (`--ckpt`). Gerbicz–Li error check
    **[todo]** — non-trivial for the arbitrary exponent `M-1` (not a pure power of
    two), so it needs the block-check generalisation, not the plain Pépin form.
-5. **[DONE] Benchmark vs. CPU.** k=14…18 measured; crossover at **k=17** (GPU vs
-   one GMP core). Recorded in `BENCHMARKS.md`.
+5. **[DONE] Benchmark vs. CPU.** k=13…18 measured; crossover at **k=15** (GPU vs
+   one GMP core); k=16 at 2.3×, k=18 at ~6×. Recorded in `BENCHMARKS.md`.
 6. **[TODO] Integrate** behind the same CLI/journal contract as `prp_test` so the
    pipeline (sieve → PRP → prove) can route large k to the GPU.
 
-**Performance status.** A **multi-stage shared-memory NTT** is now in: the
-small-stride stages (len ≤ 2048) run in one kernel per transform via a shared-memory
-tile, cutting stage launches ~2–3×. It preserves correctness but moved the crossover
-only marginally (still k=17), which localises the remaining floor to **kernel-launch
-latency + the carry's per-batch host sync**, not the NTT stages. The next levers, in
-order of expected payoff:
-1. **Carry without host syncs** — replace the convergence check (a device→host flag
-   copy every few passes) with a fixed, provably-sufficient pass count or a
-   device-side fixpoint, removing the serialising syncs from every squaring.
-2. **Large-stride stages via a four-/six-step decomposition** so those also run in
-   shared memory (one more launch reduction).
-3. **Batch the whole squaring into fewer kernels** (fuse weight→NTT and
-   NTT→pointwise boundaries).
+**Performance status — goal met.** The engine was overhead-bound, not
+compute-bound (Montgomery/DIF-DIT barely moved it). Two changes fixed that:
+1. **Multi-stage shared-memory NTT** — small-stride stages (len ≤ 2048) fold into
+   one kernel per transform.
+2. **Sync-free carry** (decisive) — the carry's convergence check was a device→host
+   flag copy that serialised every squaring. Replaced with a fixed pass count over
+   bounded **redundant digits** (full normalisation only once at the end). This cut
+   per-squaring time ~5–8× and moved the crossover from k=17 to **k=15**.
 
-Montgomery/arithmetic speedups do not help here (confirmed overhead-bound).
+Result: k=16 runs at 2.3× a CPU core, k=18 at ~6×. Optional further speed (large-
+stride stages in shared memory via a four-/six-step decomposition) is not needed to
+meet the goal. Plain arithmetic speedups do not help (confirmed overhead-bound).
 
 ---
 
