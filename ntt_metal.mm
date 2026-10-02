@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include <random>
+#include <chrono>
 
 using u32 = uint32_t;
 using u64 = uint64_t;
@@ -841,17 +842,25 @@ static int selftest_prp(int k, u64 b, unsigned long base_a) {
     std::vector<i64> acc = mpz_to_digits(a_red, N, b);
     std::vector<i64> res(N, 0); res[0] = 1;
     size_t bits = mpz_sizeinbase(E, 2);
+    auto t0 = std::chrono::steady_clock::now();
     for (size_t i = bits; i-- > 0;) {
         res = eng.negamul(res, res, true);
         if (mpz_tstbit(E, (mp_bitcnt_t)i)) res = eng.negamul(res, acc, false);
     }
+    double gpu_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     digits_to_mpz(got, res, b); mpz_mod(got, got, M);   // reduce to M at the very end
 
-    mpz_powm(ref, a_mpz, E, M);                          // GMP oracle
+    auto t1 = std::chrono::steady_clock::now();
+    mpz_powm(ref, a_mpz, E, M);                          // GMP oracle (1 core)
+    double cpu_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+
     bool ok = (mpz_cmp(got, ref) == 0);
     bool prp = (mpz_cmp_ui(ref, 1) == 0);
     printf("  GPU residue vs GMP: %s   |   M is %s\n",
            ok ? "MATCH" : "MISMATCH", prp ? "probable prime" : "composite");
+    printf("  timing: GPU %.3f s   CPU/GMP(1 core) %.4f s   -> GPU is %.1fx %s\n",
+           gpu_s, cpu_s, gpu_s > cpu_s ? gpu_s / cpu_s : cpu_s / gpu_s,
+           gpu_s > cpu_s ? "SLOWER" : "faster");
 
     mpz_clears(BN1, M, E, a_mpz, a_red, ref, got, nullptr);
     return ok ? 0 : 1;
