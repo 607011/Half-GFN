@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Half-GFN — hunting giant primes on your own machine</title>
+<meta name="description" content="A self-contained, ARM-native toolchain for hunting a special family of very large prime numbers — sieve, probable-prime test, and proof — built to run solo and offline.">
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #5c5c5c;
+    --accent: #b23a1e;      /* warm red, magazine-ish */
+    --accent-2: #0b6;
+    --line: #e6e3dc;
+    --code-bg: #f3f1ea;
+    --maxw: 760px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15140f;
+      --panel: #1d1c17;
+      --ink: #eceae3;
+      --muted: #a39f94;
+      --accent: #ff7a5c;
+      --accent-2: #4ad296;
+      --line: #322f27;
+      --code-bg: #26241d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 20px; }
+  header.hero {
+    padding: 72px 20px 40px;
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(900px 300px at 80% -40%, color-mix(in srgb, var(--accent) 14%, transparent), transparent);
+  }
+  .kicker {
+    font-size: 13px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 700; margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(30px, 6vw, 46px); line-height: 1.1; margin: 0 0 16px;
+    letter-spacing: -0.02em;
+  }
+  .lede { font-size: clamp(18px, 2.4vw, 21px); color: var(--muted); margin: 0; }
+  main { padding: 8px 0 40px; }
+  section { padding: 34px 0; border-bottom: 1px solid var(--line); }
+  section:last-of-type { border-bottom: none; }
+  h2 {
+    font-size: clamp(22px, 3.4vw, 28px); line-height: 1.2; margin: 0 0 14px;
+    letter-spacing: -0.01em;
+  }
+  h2 .n {
+    display: inline-block; min-width: 1.6em; color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  h3 { font-size: 18px; margin: 26px 0 6px; }
+  p { margin: 0 0 16px; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  strong { font-weight: 650; }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--code-bg); padding: 0.1em 0.4em; border-radius: 5px;
+    font-size: 0.92em;
+  }
+  .formula {
+    display: block; background: var(--code-bg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 20px; margin: 18px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 19px; text-align: center; overflow-x: auto;
+  }
+  .formula small { display:block; font-family: inherit; color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .pipeline { display: grid; gap: 14px; margin: 20px 0; }
+  @media (min-width: 620px) { .pipeline { grid-template-columns: 1fr 1fr 1fr; } }
+  .stage {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .stage .tag { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent-2); font-weight: 700; }
+  .stage h3 { margin: 6px 0 6px; font-size: 17px; }
+  .stage p { font-size: 14.5px; color: var(--muted); margin: 0; }
+  .stats { display: grid; gap: 14px; margin: 18px 0 4px; }
+  @media (min-width: 560px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; text-align: center; }
+  .stat .big { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .stat .lbl { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  table.bench { width: 100%; border-collapse: collapse; margin: 16px 0; font-variant-numeric: tabular-nums; }
+  table.bench th, table.bench td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 15px; }
+  table.bench th:first-child, table.bench td:first-child { text-align: left; }
+  table.bench thead th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  .win { color: var(--accent-2); font-weight: 700; }
+  .note { background: var(--code-bg); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 18px 0; font-size: 15px; color: var(--muted); }
+  .cta { display: inline-block; margin: 6px 10px 6px 0; padding: 11px 18px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); text-decoration: none; font-weight: 600; font-size: 15px; }
+  .cta.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  footer { padding: 30px 20px 60px; color: var(--muted); font-size: 14px; text-align: center; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="kicker">Prime hunting · solo · offline · ARM-native</p>
+    <h1>Half-GFN: chasing giant primes on a machine you own</h1>
+    <p class="lede">A small, self-contained toolchain for hunting a particular family of very large
+    prime numbers — no cluster, no cloud, no account. Just your CPU, your GPU, and a lot of patience.</p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section>
+    <p>Hunting record-breaking primes is usually a team sport. Projects like GIMPS pool thousands of
+    volunteer PCs to find the next biggest prime. This project asks a different question: <strong>how far can
+    one person get, alone, on hardware that is already on their desk?</strong> No distributed client phoning
+    home, nothing that stops working when a server goes dark — a toolchain you can clone, build, and run on a
+    laptop, that keeps producing real, provable results.</p>
+    <p>It targets one specific, slightly exotic family of numbers, and it carries each candidate all the way
+    from "might be prime" to a mathematical certificate that says "<em>is</em> prime, no doubt." Here is how
+    the machine works.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">1</span>The quarry: "halved" generalized Fermat numbers</h2>
+    <p>Every number the project tests has the same shape:</p>
+    <div class="formula">
+      M = (b<sup>N</sup> + 1) / 2 &nbsp;&nbsp;with&nbsp;&nbsp; N = 2<sup>k</sup>, &nbsp; b odd
+      <small>e.g. b = 3, k = 4 → N = 16 → (3¹⁶ + 1) / 2 = 21&nbsp;523&nbsp;361 (prime)</small>
+    </div>
+    <p>Unpack that in plain words. Take an odd number <code>b</code>, raise it to a power that is itself a
+    power of two (that is what <code>N = 2<sup>k</sup></code> means — 2, 4, 8, 16, 32 …), add one, and halve
+    the result. Because <code>b</code> is odd, <code>b<sup>N</sup>+1</code> is even, so the halving always
+    comes out whole.</p>
+    <p>Numbers of the form <code>b<sup>N</sup>+1</code> with a power-of-two exponent are called
+    <strong>generalized Fermat numbers</strong>, a classic happy hunting ground for large primes. The twist
+    here is the division by two — hence "half-GFN." That small change rules out the usual quick primality
+    test for Fermat numbers, which is exactly what makes this family a fun, slightly off-the-beaten-path
+    target to build your own tools for.</p>
+    <p>Why these at all? Because the exponent being a power of two gives the numbers a very regular internal
+    structure — and that structure is precisely what lets a clever sieve and a fast multiplication trick (both
+    below) chew through candidates that are otherwise far too big to test by brute force. Crank <code>k</code>
+    up and the numbers balloon fast: <code>k = 10</code> already means roughly 3&nbsp;000 decimal digits,
+    <code>k = 16</code> around 200&nbsp;000 digits.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>The assembly line</h2>
+    <p>You cannot just ask "is this 200&nbsp;000-digit number prime?" and wait. The work is staged, cheapest
+    filter first, so that expensive tests only ever see candidates worth the effort.</p>
+    <div class="pipeline">
+      <div class="stage">
+        <div class="tag">Stage 1 · Sieve</div>
+        <h3>Throw out the easy losers</h3>
+        <p>Like the ancient Sieve of Eratosthenes, but smart: any small factor of one of these numbers must
+        have a special form, so the sieve only ever tries those. Most candidates fall here, fast.</p>
+      </div>
+      <div class="stage">
+        <div class="tag">Stage 2 · PRP</div>
+        <h3>Ask: "probably prime?"</h3>
+        <p>A fast probabilistic test (Miller–Rabin) that survivors must pass. A pass means "almost certainly
+        prime"; a fail is a definite "composite." Cheap enough to run on everything the sieve lets through.</p>
+      </div>
+      <div class="stage">
+        <div class="tag">Stage 3 · Proof</div>
+        <h3>Turn "probably" into "certainly"</h3>
+        <p>The survivors get a real primality proof (APR-CL / ECPP, via PARI/GP) that produces a certificate.
+        Only now is a number allowed to be called <em>prime</em>.</p>
+      </div>
+    </div>
+    <p>The distinction in stage 2 matters more than it looks. A "probable prime" has passed a test that
+    <em>every</em> prime passes — but a vanishingly small number of composites sneak through too. During
+    development the tools actually caught one such impostor: a number that happily passed the test for one
+    base yet was composite. That is not a bug, it is the whole reason stage 3 exists. Nothing here is called
+    prime on a probabilistic nod alone.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>Making it fast — and then much faster</h2>
+    <p>The project started as a readable Python script, got rewritten in C++ for speed, and then learned to
+    use every core and, eventually, the graphics card. The interesting part is <em>why</em> a GPU helps at
+    all.</p>
+    <p>The expensive thing a primality test does, over and over, is <strong>square a gigantic number</strong>
+    — hundreds of thousands of times per candidate. Multiply two million-digit numbers the way you learned in
+    school and the work grows with the <em>square</em> of the length: hopeless. The standard escape is an
+    <strong>FFT</strong> — the same Fast Fourier Transform used in audio and image processing — which turns
+    multiplication into something that grows almost linearly instead. Suddenly multiplying million-digit
+    numbers is merely slow, not impossible.</p>
+    <p>And an FFT is exactly the kind of wide, repetitive arithmetic a GPU devours. So the heavy multiplication
+    gets handed to the graphics card — using an <em>integer</em> variant of the transform (an NTT), which is
+    exact to the last bit, no rounding to worry about. On an NVIDIA RTX 4060 the GPU engine overtakes a CPU
+    core at <code>k = 15</code>; on an Apple&nbsp;M2&nbsp;Pro, one step later at <code>k = 16</code>, and it
+    keeps pulling ahead as the numbers grow:</p>
+    <table class="bench">
+      <thead><tr><th>k (exponent 2ᵏ)</th><th>GPU vs. one CPU core</th></tr></thead>
+      <tbody>
+        <tr><td>15</td><td>0.75×</td></tr>
+        <tr><td>16</td><td class="win">1.08× — GPU wins</td></tr>
+        <tr><td>17</td><td class="win">1.41×</td></tr>
+        <tr><td>18</td><td class="win">1.65×</td></tr>
+      </tbody>
+    </table>
+    <p class="note">A reality check that surprised us: when the GPU engine was first working it was <em>slower</em>
+    than the CPU — and profiling showed the graphics card was not the problem at all. Almost all the time was
+    being burned in a bookkeeping step back on the CPU. Measuring, not guessing, is what found the real
+    bottleneck and flipped the result. A good reminder that intuition about where a program spends its time is
+    usually wrong.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">4</span>Trust nothing, verify everything</h2>
+    <p>When you are generating numbers no one has ever checked, "it ran without crashing" is not good enough.
+    So every fast path is pinned to a slow, trusted one. The GPU's answer is checked against the CPU's answer;
+    both are checked against a rock-solid reference library (GMP). A hand-written test runs millions of
+    operations and compares every single bit.</p>
+    <p>The guiding rule throughout: <strong>never ship a result you cannot independently reproduce</strong>,
+    and never merge code to the main branch until it has actually been shown to work on the target machine.
+    For a prime hunt that may run for days, a silent hardware glitch or an off-by-one is the enemy — the
+    cross-checks are the project's immune system.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">5</span>Where it stands</h2>
+    <p>Run solo on ordinary hardware, the pipeline has already turned out a healthy pile of
+    <em>proven</em> primes (not just probable ones):</p>
+    <div class="stats">
+      <div class="stat"><div class="big">305,907</div><div class="lbl">proven primes at k = 4 (bases up to 21 million)</div></div>
+      <div class="stat"><div class="big">123,473</div><div class="lbl">proven primes at k = 5 (partial run)</div></div>
+      <div class="stat"><div class="big">k = 16</div><div class="lbl">where the GPU engine overtakes a CPU core</div></div>
+    </div>
+    <p>The larger the exponent <code>k</code>, the rarer and the more expensive the primes become — and that
+    is where the GPU work earns its keep, and where the next experiments are headed.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">6</span>Take a look</h2>
+    <p>The whole thing is open source: the sieve, the probable-prime filter, the proof wrapper, the GPU
+    engines for both Apple Metal and NVIDIA CUDA, and documentation of how the pieces fit together — plus an
+    honest record of what was tried, measured, and sometimes thrown away.</p>
+    <p>
+      <a class="cta primary" href="https://github.com/607011/Half-GFN">Browse the code on GitHub</a>
+      <a class="cta" href="https://github.com/607011/Half-GFN/blob/main/README.md">Read the README</a>
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    Half-GFN — a solo prime-hunting toolchain. Built for curiosity, documented for the world.<br>
+    Source and full technical write-ups on <a href="https://github.com/607011/Half-GFN">GitHub</a>.
+  </div>
+</footer>
+
+</body>
+</html>
