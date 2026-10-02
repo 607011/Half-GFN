@@ -590,10 +590,6 @@ static std::vector<i64> carry_balanced(const std::vector<i128>& c, u64 b) {
     return out;
 }
 
-static std::vector<i64> digits_vec_i64(const std::vector<u32>& x) {
-    return std::vector<i64>(x.begin(), x.end());
-}
-
 static void digits_to_mpz(mpz_t out, const std::vector<i64>& d, u64 b) {
     mpz_set_ui(out, 0);
     for (size_t j = d.size(); j-- > 0;) {
@@ -601,6 +597,19 @@ static void digits_to_mpz(mpz_t out, const std::vector<i64>& d, u64 b) {
         if (d[j] >= 0) mpz_add_ui(out, out, (unsigned long)d[j]);
         else           mpz_sub_ui(out, out, (unsigned long)(-d[j]));
     }
+}
+
+// Base-b digits (non-negative, length N) of a non-negative mpz x < b^N.
+static std::vector<i64> mpz_to_digits(const mpz_t x, u64 N, u64 b) {
+    mpz_t t, q; mpz_init_set(t, x); mpz_init(q);
+    std::vector<i64> d(N, 0);
+    for (u64 j = 0; j < N; ++j) {
+        u64 r = mpz_fdiv_q_ui(q, t, (unsigned long)b);
+        d[j] = (i64)r;
+        mpz_set(t, q);
+    }
+    mpz_clear(t); mpz_clear(q);
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,42 +622,48 @@ struct PrimeGPU {
     id<MTLBuffer> bWf, bWi, bWJ, bWIJ;
 };
 
-static int selftest_negamul(int k, u64 b, int reps) {
-    const u64 N = (u64)1 << k;
-    if ((b & 1) == 0 || b < 3) { fprintf(stderr, "need odd b >= 3\n"); return 2; }
-    std::vector<u32> primes = ntt_primes_bound(N, b);
-    if (primes.empty()) { fprintf(stderr, "no NTT primes for k=%d b=%llu\n", k,
-                                  (unsigned long long)b); return 2; }
-    const u32 ln = (u32)k;
+// ---------------------------------------------------------------------------
+// The engine: per-prime GPU NTT channels built once; negamul() runs one
+// negacyclic multiply/square mod (b^N+1) and returns balanced base-b digits.
+// Inputs/outputs are signed (balanced) digits so results feed straight back in.
+// ---------------------------------------------------------------------------
+struct Engine {
+    int k = 0; u64 N = 0, b = 0;
+    std::vector<u32> primes;
+    id<MTLDevice> dev = nil;
+    id<MTLCommandQueue> q = nil;
+    id<MTLComputePipelineState> psLW, psBR, psST, psSQ, psMUL, psFIN;
+    std::vector<PrimeGPU> G;
+    id<MTLBuffer> bInX, bInY, bW, bFx, bFy, bT;
+    u32 ln = 0, nn = 0;
 
-    @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        if (!dev) { fprintf(stderr, "no Metal device\n"); return 2; }
+    bool init(int k_, u64 b_) {
+        k = k_; N = (u64)1 << k_; b = b_; ln = (u32)k_; nn = (u32)N;
+        if ((b & 1) == 0 || b < 3) { fprintf(stderr, "need odd b >= 3\n"); return false; }
+        primes = ntt_primes_bound(N, b);
+        if (primes.empty()) { fprintf(stderr, "no NTT primes for k=%d b=%llu\n",
+                                      k, (unsigned long long)b); return false; }
+        dev = MTLCreateSystemDefaultDevice();
+        if (!dev) { fprintf(stderr, "no Metal device\n"); return false; }
         NSError* err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kKernelSource]
                                                options:nil error:&err];
-        if (!lib) { fprintf(stderr, "compile failed: %s\n", err.localizedDescription.UTF8String); return 2; }
+        if (!lib) { fprintf(stderr, "compile failed: %s\n", err.localizedDescription.UTF8String); return false; }
         auto pso_for = [&](const char* name) -> id<MTLComputePipelineState> {
             id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
             id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
             if (!ps) { fprintf(stderr, "pso %s: %s\n", name, err.localizedDescription.UTF8String); exit(2); }
             return ps;
         };
-        id<MTLComputePipelineState> psLW  = pso_for("k_load_weight");
-        id<MTLComputePipelineState> psBR  = pso_for("k_bitrev");
-        id<MTLComputePipelineState> psST  = pso_for("k_stage");
-        id<MTLComputePipelineState> psSQ  = pso_for("k_sq");
-        id<MTLComputePipelineState> psMUL = pso_for("k_mul");
-        id<MTLComputePipelineState> psFIN = pso_for("k_final");
-        id<MTLCommandQueue> q = [dev newCommandQueue];
+        psLW = pso_for("k_load_weight"); psBR = pso_for("k_bitrev");
+        psST = pso_for("k_stage");       psSQ = pso_for("k_sq");
+        psMUL = pso_for("k_mul");        psFIN = pso_for("k_final");
+        q = [dev newCommandQueue];
 
         auto mkbuf = [&](const void* src, size_t bytes) {
             return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
                        : [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         };
-
-        // Per-prime GPU tables (built once).
-        std::vector<PrimeGPU> G;
         for (u32 p : primes) {
             PrimeGPU g; g.p = p; g.n0 = mont_n0(p); g.r2 = mont_r2(p);
             u32 psi = find_psi(p, N);
@@ -667,22 +682,19 @@ static int selftest_negamul(int k, u64 b, int reps) {
             g.bWIJ = mkbuf(WIJ.data(), N * 4);
             G.push_back(g);
         }
+        bInX = mkbuf(nullptr, N * 4); bInY = mkbuf(nullptr, N * 4);
+        bW = mkbuf(nullptr, N * 4);
+        bFx = mkbuf(nullptr, N * 4); bFy = mkbuf(nullptr, N * 4);
+        bT = mkbuf(nullptr, N * 4);
+        return true;
+    }
 
-        // Scratch buffers (reused across primes).
-        // Separate input buffers for x and y: the CPU memcpy into a shared input
-        // buffer happens at encode time (before commit), so a single bIn would be
-        // clobbered by y before the GPU reads x. bW is GPU-written/read only, so
-        // Metal's hazard tracking serialises it safely across the two forwards.
-        id<MTLBuffer> bInX = mkbuf(nullptr, N * 4), bInY = mkbuf(nullptr, N * 4);
-        id<MTLBuffer> bW = mkbuf(nullptr, N * 4);
-        id<MTLBuffer> bFx = mkbuf(nullptr, N * 4), bFy = mkbuf(nullptr, N * 4);
-        id<MTLBuffer> bT  = mkbuf(nullptr, N * 4);
-        u32 nn = (u32)N;
-
-        // Run one negacyclic multiply/square on the GPU; returns N result digits
-        // (balanced) via CPU CRT + carry.
-        auto gpu_negamul = [&](const std::vector<u32>& x, const std::vector<u32>& y,
-                               bool squaring) -> std::vector<i64> {
+    // One negacyclic multiply (squaring when squaring==true) of signed base-b
+    // digit vectors mod (b^N+1); returns balanced base-b digits.
+    std::vector<i64> negamul(const std::vector<i64>& x, const std::vector<i64>& y,
+                             bool squaring) {
+        std::vector<i64> result;
+        @autoreleasepool {
             std::vector<std::vector<u32>> cres(primes.size(), std::vector<u32>(N));
             id<MTLCommandBuffer> cb = [q commandBuffer];
             auto disp = [&](id<MTLComputePipelineState> ps, NSUInteger threads,
@@ -693,9 +705,11 @@ static int selftest_negamul(int k, u64 b, int reps) {
                 [e dispatchThreads:MTLSizeMake(threads,1,1) threadsPerThreadgroup:MTLSizeMake(t,1,1)];
                 [e endEncoding];
             };
-            auto forward = [&](PrimeGPU& g, const std::vector<u32>& src,
+            // reduce signed digits mod p into [0,p), upload, weight, transform
+            auto forward = [&](PrimeGPU& g, const std::vector<i64>& src,
                                id<MTLBuffer> bIn, id<MTLBuffer> dst) {
-                memcpy(bIn.contents, src.data(), N * 4);
+                u32* in = (u32*)bIn.contents; u32 pr = g.p;
+                for (u64 j = 0; j < N; ++j) { i64 r = src[j] % (i64)pr; if (r < 0) r += pr; in[j] = (u32)r; }
                 id<MTLBuffer> WJ = g.bWJ, Wf = g.bWf; u32 p = g.p, n0 = g.n0, r2 = g.r2;
                 disp(psLW, N, ^(id<MTLComputeCommandEncoder> e){
                     [e setBuffer:bIn offset:0 atIndex:0]; [e setBuffer:bW offset:0 atIndex:1];
@@ -747,64 +761,109 @@ static int selftest_negamul(int k, u64 b, int reps) {
                     [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
                     [e setBytes:&ninv length:4 atIndex:4];
                 });
-                // channel result lands in bT; stash before it is reused next prime.
-                // (serialised: one command buffer per prime would also work, but we
-                //  read bT only after waitUntilCompleted, so copy out per prime via
-                //  a dedicated commit below.)
                 [cb commit]; [cb waitUntilCompleted];
                 if (cb.error) { fprintf(stderr, "GPU error: %s\n",
                                cb.error.localizedDescription.UTF8String); exit(2); }
                 memcpy(cres[pi].data(), bT.contents, N * 4);
                 cb = [q commandBuffer];
             }
-            // CPU: balanced CRT per coefficient, then balanced base-b carry.
             std::vector<i128> c(N);
             std::vector<u32> col(primes.size());
             for (u64 j = 0; j < N; ++j) {
                 for (size_t pi = 0; pi < primes.size(); ++pi) col[pi] = cres[pi][j];
                 c[j] = crt_balanced(col, primes);
             }
-            return carry_balanced(c, b);
-        };
-
-        printf("Metal device: %s\n", dev.name.UTF8String);
-        printf("negamul self-test: k=%d N=%llu b=%llu  %zu NTT primes  %d reps\n",
-               k, (unsigned long long)N, (unsigned long long)b, primes.size(), reps);
-
-        mpz_t BN1, X, Y, Z, GOT; mpz_inits(BN1, X, Y, Z, GOT, nullptr);
-        mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
-        std::mt19937 rng(0x5EED ^ (unsigned)k ^ (unsigned)b);
-        int fails = 0;
-        for (int r = 0; r < reps; ++r) {
-            std::vector<u32> x(N), y(N);
-            for (u64 j = 0; j < N; ++j) { x[j] = rng() % (u32)b; y[j] = rng() % (u32)b; }
-            std::vector<i64> dx = digits_vec_i64(x), dy = digits_vec_i64(y);
-            digits_to_mpz(X, dx, b); digits_to_mpz(Y, dy, b);
-
-            // multiply path
-            std::vector<i64> zm = gpu_negamul(x, y, false);
-            mpz_mul(Z, X, Y); mpz_mod(Z, Z, BN1);
-            digits_to_mpz(GOT, zm, b); mpz_mod(GOT, GOT, BN1);
-            if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  MUL mismatch rep %d\n", r); }
-
-            // square path
-            std::vector<i64> zs = gpu_negamul(x, x, true);
-            mpz_mul(Z, X, X); mpz_mod(Z, Z, BN1);
-            digits_to_mpz(GOT, zs, b); mpz_mod(GOT, GOT, BN1);
-            if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  SQ mismatch rep %d\n", r); }
+            result = carry_balanced(c, b);
         }
-        mpz_clears(BN1, X, Y, Z, GOT, nullptr);
-        printf("  GPU negamul vs GMP: %s (%d failures over %d reps x2 ops)\n",
-               fails == 0 ? "OK" : "FAIL", fails, reps);
-        return fails == 0 ? 0 : 1;
+        return result;
     }
+};
+
+static int selftest_negamul(int k, u64 b, int reps) {
+    Engine eng;
+    if (!eng.init(k, b)) return 2;
+    const u64 N = eng.N;
+
+    printf("Metal device: %s\n", eng.dev.name.UTF8String);
+    printf("negamul self-test: k=%d N=%llu b=%llu  %zu NTT primes  %d reps\n",
+           k, (unsigned long long)N, (unsigned long long)b, eng.primes.size(), reps);
+
+    mpz_t BN1, X, Y, Z, GOT; mpz_inits(BN1, X, Y, Z, GOT, nullptr);
+    mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
+    std::mt19937 rng(0x5EED ^ (unsigned)k ^ (unsigned)b);
+    int fails = 0;
+    for (int r = 0; r < reps; ++r) {
+        std::vector<i64> x(N), y(N);
+        for (u64 j = 0; j < N; ++j) { x[j] = rng() % (u32)b; y[j] = rng() % (u32)b; }
+        digits_to_mpz(X, x, b); digits_to_mpz(Y, y, b);
+
+        std::vector<i64> zm = eng.negamul(x, y, false);        // multiply path
+        mpz_mul(Z, X, Y); mpz_mod(Z, Z, BN1);
+        digits_to_mpz(GOT, zm, b); mpz_mod(GOT, GOT, BN1);
+        if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  MUL mismatch rep %d\n", r); }
+
+        std::vector<i64> zs = eng.negamul(x, x, true);         // square path
+        mpz_mul(Z, X, X); mpz_mod(Z, Z, BN1);
+        digits_to_mpz(GOT, zs, b); mpz_mod(GOT, GOT, BN1);
+        if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  SQ mismatch rep %d\n", r); }
+    }
+    mpz_clears(BN1, X, Y, Z, GOT, nullptr);
+    printf("  GPU negamul vs GMP: %s (%d failures over %d reps x2 ops)\n",
+           fails == 0 ? "OK" : "FAIL", fails, reps);
+    return fails == 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: full strong-PRP powering a^(M-1) mod M on the GPU.  Run the whole
+// chain mod (b^N+1) with the NTT engine (left-to-right binary), reduce to
+// M = (b^N+1)/2 only at the end, and compare the residue AND the prime/composite
+// verdict to GMP's mpz_powm.
+// ---------------------------------------------------------------------------
+static int selftest_prp(int k, u64 b, unsigned long base_a) {
+    Engine eng;
+    if (!eng.init(k, b)) return 2;
+    const u64 N = eng.N;
+
+    mpz_t BN1, M, E, a_mpz, a_red, ref, got;
+    mpz_inits(BN1, M, E, a_mpz, a_red, ref, got, nullptr);
+    mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
+    mpz_fdiv_q_ui(M, BN1, 2);              // M = (b^N+1)/2
+    mpz_sub_ui(E, M, 1);                   // E = M-1 = (b^N-1)/2
+    mpz_set_ui(a_mpz, base_a);
+    mpz_mod(a_red, a_mpz, BN1);
+
+    printf("Metal device: %s\n", eng.dev.name.UTF8String);
+    printf("prp self-test: k=%d N=%llu b=%llu base=%lu  |M|=%zu bits  %zu NTT primes\n",
+           k, (unsigned long long)N, (unsigned long long)b, base_a,
+           mpz_sizeinbase(M, 2), eng.primes.size());
+
+    // GPU powering, residue in balanced base-b digits.
+    std::vector<i64> acc = mpz_to_digits(a_red, N, b);
+    std::vector<i64> res(N, 0); res[0] = 1;
+    size_t bits = mpz_sizeinbase(E, 2);
+    for (size_t i = bits; i-- > 0;) {
+        res = eng.negamul(res, res, true);
+        if (mpz_tstbit(E, (mp_bitcnt_t)i)) res = eng.negamul(res, acc, false);
+    }
+    digits_to_mpz(got, res, b); mpz_mod(got, got, M);   // reduce to M at the very end
+
+    mpz_powm(ref, a_mpz, E, M);                          // GMP oracle
+    bool ok = (mpz_cmp(got, ref) == 0);
+    bool prp = (mpz_cmp_ui(ref, 1) == 0);
+    printf("  GPU residue vs GMP: %s   |   M is %s\n",
+           ok ? "MATCH" : "MISMATCH", prp ? "probable prime" : "composite");
+
+    mpz_clears(BN1, M, E, a_mpz, a_red, ref, got, nullptr);
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
     int k = 16;
     u64 b = 10001;
     int reps = 8;
+    unsigned long base_a = 3;
     std::string mode;
+    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp} [--k K] [--b B] [--base A] [--reps R]\n";
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) {
@@ -814,12 +873,14 @@ int main(int argc, char** argv) {
         if      (s == "--selftest") mode = nx("--selftest");
         else if (s == "--k")        k = atoi(nx("--k"));
         else if (s == "--b")        b = strtoull(nx("--b"), nullptr, 10);
+        else if (s == "--base")     base_a = strtoul(nx("--base"), nullptr, 10);
         else if (s == "--reps")     reps = atoi(nx("--reps"));
-        else { fprintf(stderr, "Usage: %s --selftest {montmul|ntt|negamul} [--k K] [--b B] [--reps R]\n", argv[0]); return 2; }
+        else { fprintf(stderr, usage, argv[0]); return 2; }
     }
     if (mode == "montmul")  return selftest_montmul(k);
     if (mode == "ntt")      return selftest_ntt(k);
     if (mode == "negamul")  return selftest_negamul(k, b, reps);
-    fprintf(stderr, "Usage: %s --selftest {montmul|ntt|negamul} [--k K] [--b B] [--reps R]\n", argv[0]);
+    if (mode == "prp")      return selftest_prp(k, b, base_a);
+    fprintf(stderr, usage, argv[0]);
     return 2;
 }
