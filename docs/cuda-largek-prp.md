@@ -6,6 +6,12 @@ digits. The existing `prp_cuda.cu` (one thread per candidate) is a medium-k
 prototype and loses to the CPU at every size (see [`../BENCHMARKS.md`](../BENCHMARKS.md));
 this is a separate engine, not an evolution of that kernel.
 
+For the Apple Silicon (Metal) port of this same design, see the sibling
+[`metal-largek-prp.md`](metal-largek-prp.md): identical math and shared
+[`../ntt_ref.cpp`](../ntt_ref.cpp) oracle, different hardware layer (integer NTT
+forced by the absence of fp64, 32-bit Montgomery modmul, four-step tiled
+transform, unified-memory CPU-side CRT/carry).
+
 Status: design only. Nothing here is built yet.
 
 ---
