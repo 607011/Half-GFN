@@ -95,6 +95,14 @@ if(APPLE)
             COMPILE_OPTIONS "-fobjc-arc")
         target_link_libraries(prp_metal PRIVATE
             hgfn_flags GMP::GMP ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+
+        # Large-k NTT PRP engine for Apple Silicon (see docs/metal-largek-prp.md).
+        # Work in progress; built incrementally, each stage gated vs. ntt_ref.
+        add_executable(ntt_metal ntt_metal.mm)
+        set_source_files_properties(ntt_metal.mm PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(ntt_metal PRIVATE
+            hgfn_flags GMP::GMP ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
     else()
         message(STATUS "Metal/Foundation not found -- skipping prp_metal.")
     endif()
