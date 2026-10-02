@@ -19,7 +19,14 @@ its CUDA cousin it loses to the CPU at every size it supports; it stays only as 
 convenience / cross-check oracle. This large-k engine is a separate paradigm:
 **one squaring spread across the whole GPU**, not one candidate per thread.
 
-Status: design only. Nothing here is built yet.
+**Status (2026-10-02): implemented and verified through stage 5a** in
+[`../ntt_metal.mm`](../ntt_metal.mm). Stages 2a–4 (32-bit Montgomery modmul,
+single-prime NTT, multi-prime negamul mod `b^N+1`, full `a^(M-1)` PRP powering)
+all match GMP bit-for-bit; stage 5a (CPU post-processing optimisation) reaches the
+**crossover at k=16** on an M2 Pro (1.65× at k=18) — see
+[`../BENCHMARKS.md`](../BENCHMARKS.md). Still open: four-step tiling (§4), and
+Gerbicz–Li + checkpoint (§5 stage 4). The one finding that changed the plan is in
+§2.1 below.
 
 ---
 
@@ -89,6 +96,22 @@ Move CRT/carry onto the GPU later only if profiling says the CPU half is the
 bottleneck (on an integrated GPU, memory bandwidth is shared, so it often is not
 worth it early).
 
+> **Finding (stage 5a, measured — this corrects the paragraph above).** Keeping
+> CRT + carry on the CPU is the right call, but it is **not** cheap-by-default: in
+> the first working engine it was **74–94% of the per-squaring time**, not the GPU
+> transform. The GPU dispatch stayed flat with k (~0.7→1.5 ms); the CPU half grew
+> linearly and dominated. The naive CPU post ran mpz Garner CRT **per coefficient**
+> with a `modinv` per coefficient — O(N) with huge constants. The engine only
+> crossed over after the CPU half was optimised hard, all without touching the GPU:
+> (1) mpz Garner → pure `__int128` integer CRT (~3×); (2) precompute the
+> prime-set-constant Garner inverses once instead of per coefficient (~2×); (3) a
+> 2-prime fast path entirely in `u64` (`p0·p1 < 2^62`, no 128-bit divide) → crossover.
+> Lesson: on unified memory, "leave it on the CPU" must still mean *a tight,
+> mpz-free, constants-precomputed* CPU path — profile the post-processing first,
+> it is the thing that silently costs O(N) per squaring. See `crt_balanced` /
+> `CrtPlan` / the 2-prime branch in `ntt_metal.mm`, and the breakdown in
+> `--selftest bench`.
+
 ### 2.2 The GPU watchdog is handled for free by the transform structure
 
 macOS has its own GPU command-buffer timeout (it will reset the GPU and corrupt
@@ -155,23 +178,29 @@ concrete with Apple numbers:
 ## 5. Staged implementation plan
 
 Mirrors the CUDA plan but reuses our existing assets; each stage has a concrete
-pass/fail gate.
+pass/fail gate. Status markers are as of 2026-10-02 (all in `ntt_metal.mm`, each
+behind a `--selftest` mode).
 
-1. **Oracle — already done.** `ntt_ref.cpp` validates `a^(M−1) mod M` against GMP
-   for k = 4…10, bit-for-bit, including the squaring path. Nothing to build; this
-   is the ground truth for every Metal stage below.
-2. **Single-prime Metal NTT.** Implement the 32-bit Montgomery modmul (§3) and the
-   tiled forward+inverse transform (§4) for one prime, small N. Gate: pointwise
-   output matches `ntt_ref`'s per-prime NTT exactly.
-3. **Multi-prime + CRT + carry.** Add 2–3 primes; do CRT and balanced carry on the
-   **CPU** over the shared buffers (§2.1). Push N up to k=16. Gate: `negamul`
-   result matches `ntt_ref` / GMP `x·y mod (b^N+1)` exactly, random inputs.
-4. **Powering + GEC + checkpoint.** Full `a^(M−1)` chain with Gerbicz–Li every
-   ~1000 squarings and a resumable residue journal (mirror `prp_test`). Gate:
-   full PRP verdict matches GMP for k ≤ 12; GEC catches an injected bit-flip.
-5. **Benchmark vs. CPU** at k = 12, 14, 16, 18 on this machine (M2 Pro GMP,
-   `prp_test`, ~8–10 threads). Find the crossover k where the GPU overtakes the
-   CPU; set the routing threshold. Record in [`../BENCHMARKS.md`](../BENCHMARKS.md).
+1. **Oracle — DONE.** `ntt_ref.cpp` validates `a^(M−1) mod M` against GMP for
+   k = 4…10, bit-for-bit. Ground truth for every Metal stage below.
+2. **Single-prime Metal NTT — DONE (stages 2a, 2b).** 32-bit Montgomery modmul
+   (§3, `--selftest montmul`) and the forward+inverse transform (§4, currently the
+   robust **multi-dispatch** form, not yet four-step tiled; `--selftest ntt`).
+   Gate met: matches `ntt_ref`'s per-prime NTT bit-for-bit, k = 4…16.
+3. **Multi-prime + CRT + carry — DONE (stage 3).** 2–3 primes, CRT + balanced carry
+   on the CPU over shared buffers (§2.1). `--selftest negamul`. Gate met: matches
+   GMP `x·y mod (b^N+1)` for k = 4…16, bases up to ~10^9 (multiply and square).
+4. **Powering — DONE as 4a (`--selftest prp`); GEC + checkpoint still TODO (4b).**
+   Full `a^(M−1)` chain, reduced to M only at the end. Gate met: residue + verdict
+   match GMP for k ≤ 12. Gerbicz–Li every ~1000 squarings and a resumable residue
+   journal (mirror `prp_test`) are **not yet built** — required before trusting
+   long large-k runs.
+5. **Benchmark + crossover — DONE as 5a.** `--selftest bench` reports ms/squaring,
+   GPU vs one GMP core, with a GPU-vs-CPU-post breakdown. **Crossover at k=16** on
+   the M2 Pro, 1.65× at k=18; recorded in [`../BENCHMARKS.md`](../BENCHMARKS.md).
+   The optimisation that got there was all CPU-side post-processing (see §2.1
+   finding). Remaining perf work (**5b**): four-step tiling (§4) + batching the
+   primes into one command buffer to cut the GPU half and push the crossover lower.
 6. **Integrate** behind the same CLI / journal contract as `prp_test`, so the
    sieve → PRP → prove pipeline is unchanged. Route small k to CPU/`prp_metal`,
    large k to this engine.
@@ -180,17 +209,20 @@ pass/fail gate.
 
 ## 6. Honest payoff assessment
 
-Be clear-eyed before investing months: the Apple Silicon GPU is **integrated** and
-shares memory bandwidth with the CPU — it is no discrete 8 GB GDDR6 card. The NTT
-is bandwidth-hungry. Realistically:
+The Apple Silicon GPU is **integrated** and shares memory bandwidth with the CPU —
+it is no discrete 8 GB GDDR6 card. The NTT is bandwidth-hungry. The stage-5a
+measurements (BENCHMARKS.md) now replace the earlier guesses:
 
-- The **crossover k is likely higher on the Mac** than on an RTX 4060, and the
-  speedup more modest.
-- The real win may be **freeing the CPU** rather than raw throughput: run GPU PRP
-  and CPU proof (`gp` APR-CL/ECPP) concurrently, or keep BOINC fed while hunting.
-- Whether the multi-month transform effort pays off is a **Stage 5 decision**, not
-  an a-priori one. The model (CUDA doc §4) only certifies the right complexity
-  class (`O(N log N)` per squaring), not a Mac win.
+- **Crossover confirmed at k=16** on an M2 Pro (one k later than the RTX 4060's
+  k=15 — integrated vs. discrete, as predicted), scaling to **1.65× at k=18**. The
+  predicted "higher crossover, more modest speedup" held: in absolute ms/sq the
+  4060 is ~8× faster, and the Mac speedup factor is smaller (it is measured against
+  a strong single M2-P core, not an i5 core).
+- The real win is as much **freeing the CPU** as raw throughput: run GPU PRP and
+  CPU proof (`gp` APR-CL/ECPP) concurrently, or keep BOINC fed while hunting.
+- The paradigm is validated: GPU ms/sq stays ~flat with k while the GMP curve rises
+  steeply — the `O(N log N)`-per-squaring complexity class (CUDA doc §4) shows up in
+  the data on both the 4060 and the M2 Pro.
 
 What makes starting cheap on *this* platform specifically: Stage 1 is free (shared
 oracle), Stage 2 is small (one modmul + one tiled transform), and unified memory
