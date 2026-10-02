@@ -80,6 +80,11 @@ target_link_libraries(hgfn_sieve PRIVATE hgfn_flags Threads::Threads)
 add_executable(prp_test prp_test.cpp)
 target_link_libraries(prp_test PRIVATE hgfn_flags Threads::Threads GMP::GMP)
 
+# Stage 1 reference for the large-k GPU engine: CPU negacyclic-NTT squaring
+# mod (b^N+1), validated against GMP. CPU-only; see docs/cuda-largek-prp.md.
+add_executable(ntt_ref ntt_ref.cpp)
+target_link_libraries(ntt_ref PRIVATE hgfn_flags GMP::GMP)
+
 # Optional: GPU-accelerated PRP test via Apple Metal (macOS only, Regime A).
 if(APPLE)
     find_library(METAL_FRAMEWORK Metal)
