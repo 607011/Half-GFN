@@ -59,6 +59,76 @@ static bool is_prime_u64(u64 n) {
     return r != 0;
 }
 
+// Plain u64 modular arithmetic for p < 2^31 (products fit in u64). Setup only.
+static inline u64 mulmod(u64 a, u64 b, u64 p) { return (a * b) % p; }
+static u64 powmod(u64 a, u64 e, u64 p) {
+    u64 r = 1 % p; a %= p;
+    while (e) { if (e & 1) r = mulmod(r, a, p); a = mulmod(a, a, p); e >>= 1; }
+    return r;
+}
+static inline u64 modinv(u64 a, u64 p) { return powmod(a, p - 2, p); }
+
+// Host Montgomery conversion, R = 2^32:  toMont(x) = x*R mod p.
+static inline u32 to_mont(u32 x, u32 p) { return (u32)((((u64)x) << 32) % p); }
+
+// A 2N-th root of unity psi with psi^N == -1 (order exactly 2N).  (cf. ntt_ref)
+static u32 find_psi(u32 p, u64 N) {
+    u64 e = (p - 1) / (2 * N);
+    std::mt19937_64 rng(0x9E3779B97F4A7C15ull ^ p);
+    for (;;) {
+        u64 g = 2 + rng() % (p - 3);
+        u64 r = powmod(g, e, p);
+        if (powmod(r, N, p) == p - 1) return (u32)r;
+    }
+}
+
+// Iterative radix-2 NTT in the normal domain (CPU reference, matches ntt_ref).
+static void ntt_cpu(std::vector<u32>& a, u32 p, u32 root) {
+    const int n = (int)a.size();
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        u64 wlen = powmod(root, (u64)(n / len), p);
+        for (int i = 0; i < n; i += len) {
+            u64 w = 1;
+            for (int t = 0; t < len / 2; ++t) {
+                u64 u = a[i + t];
+                u64 v = mulmod(a[i + t + len / 2], w, p);
+                a[i + t]           = (u32)((u + v) % p);
+                a[i + t + len / 2] = (u32)((u + p - v) % p);
+                w = mulmod(w, wlen, p);
+            }
+        }
+    }
+}
+
+// CPU reference: single-prime negacyclic squaring of digit vector x (length N,
+// entries < p) mod (X^N + 1), reduced mod p. Returns the N result coefficients.
+static std::vector<u32> negasq_cpu(const std::vector<u32>& x, u32 p, u64 N) {
+    u32 psi = find_psi(p, N);
+    u32 omega = (u32)mulmod(psi, psi, p);
+    u32 omega_inv = (u32)modinv(omega, p);
+    u32 psi_inv = (u32)modinv(psi, p);
+    u32 ninv = (u32)modinv(N % p, p);
+    std::vector<u32> A(N);
+    u64 w = 1;
+    for (u64 j = 0; j < N; ++j) { A[j] = (u32)mulmod(x[j], w, p); w = mulmod(w, psi, p); }
+    ntt_cpu(A, p, omega);
+    for (u64 j = 0; j < N; ++j) A[j] = (u32)mulmod(A[j], A[j], p);
+    ntt_cpu(A, p, omega_inv);
+    u64 wi = 1;
+    for (u64 j = 0; j < N; ++j) {
+        A[j] = (u32)mulmod(A[j], ninv, p);
+        A[j] = (u32)mulmod(A[j], wi, p);
+        wi = mulmod(wi, psi_inv, p);
+    }
+    return A;
+}
+
 // Smallest few NTT-friendly primes p = j*2N + 1 (p < 2^31) above a floor.
 static std::vector<u32> ntt_primes(u64 N, int count) {
     std::vector<u32> out;
@@ -92,6 +162,66 @@ inline uint redc(uint hi, uint lo, uint p, uint n0) {
 // a, b in the Montgomery domain -> a*b in the Montgomery domain.
 inline uint mont_mul(uint a, uint b, uint p, uint n0) {
     return redc(mulhi(a, b), a * b, p, n0);
+}
+
+// modular add/sub for values in [0,p), p < 2^31 (so a+b and a+p-b fit in 32 bits).
+inline uint addm(uint a, uint b, uint p) { uint s = a + b;     return s >= p ? s - p : s; }
+inline uint subm(uint a, uint b, uint p) { uint s = a + p - b; return s >= p ? s - p : s; }
+
+// X[g] *= W[g]   (both already in the Montgomery domain) -- psi weighting.
+kernel void k_weight(device uint* X [[buffer(0)]],
+                     device const uint* W [[buffer(1)]],
+                     constant uint& p [[buffer(2)]], constant uint& n0 [[buffer(3)]],
+                     uint g [[thread_position_in_grid]]) {
+    X[g] = mont_mul(X[g], W[g], p, n0);
+}
+
+// Bit-reversal gather: OUT[g] = IN[reverse_ln_bits(g)].
+kernel void k_bitrev(device const uint* IN [[buffer(0)]],
+                     device uint* OUT [[buffer(1)]],
+                     constant uint& ln [[buffer(2)]],
+                     uint g [[thread_position_in_grid]]) {
+    uint r = 0;
+    for (uint b = 0; b < ln; ++b) { r = (r << 1) | ((g >> b) & 1u); }
+    OUT[g] = IN[r];
+}
+
+// One in-place Cooley-Tukey radix-2 stage. One thread per butterfly (N/2 total).
+// W is the twiddle table W[t] = root^t (Montgomery); twiddle = W[(n/len)*offset].
+kernel void k_stage(device uint* X [[buffer(0)]],
+                    device const uint* W [[buffer(1)]],
+                    constant uint& p [[buffer(2)]], constant uint& n0 [[buffer(3)]],
+                    constant uint& len [[buffer(4)]], constant uint& n [[buffer(5)]],
+                    uint g [[thread_position_in_grid]]) {
+    uint hlen   = len >> 1;
+    uint block  = g / hlen;
+    uint offset = g - block * hlen;
+    uint i = block * len + offset;
+    uint j = i + hlen;
+    uint w = W[(n / len) * offset];
+    uint u = X[i];
+    uint v = mont_mul(X[j], w, p, n0);
+    X[i] = addm(u, v, p);
+    X[j] = subm(u, v, p);
+}
+
+// Pointwise square (Montgomery domain).
+kernel void k_sq(device uint* X [[buffer(0)]],
+                 constant uint& p [[buffer(1)]], constant uint& n0 [[buffer(2)]],
+                 uint g [[thread_position_in_grid]]) {
+    uint a = X[g];
+    X[g] = mont_mul(a, a, p, n0);
+}
+
+// Finalize: X[g] = fromMont( X[g] * ninv * Wij[g] ).  ninv in Montgomery domain.
+kernel void k_final(device uint* X [[buffer(0)]],
+                    device const uint* WIJ [[buffer(1)]],
+                    constant uint& p [[buffer(2)]], constant uint& n0 [[buffer(3)]],
+                    constant uint& ninv [[buffer(4)]],
+                    uint g [[thread_position_in_grid]]) {
+    uint v = mont_mul(X[g], ninv, p, n0);
+    v = mont_mul(v, WIJ[g], p, n0);
+    X[g] = redc(0u, v, p, n0);
 }
 
 // Self-test: OUT[i] = (A[i] * B[i]) mod p, computed entirely in the Montgomery
@@ -200,6 +330,156 @@ static int selftest_montmul(int k) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2b self-test: single-prime negacyclic squaring on the GPU (weight ->
+// bit-reverse -> forward NTT -> pointwise square -> bit-reverse -> inverse NTT
+// -> 1/N + unweight), one dispatch per Cooley-Tukey stage, verified bit-for-bit
+// against the CPU reference negasq_cpu (same math mod p).
+// ---------------------------------------------------------------------------
+static int selftest_ntt(int k) {
+    const u64 N = (u64)1 << k;
+    std::vector<u32> primes = ntt_primes(N, 1);
+    if (primes.empty()) { fprintf(stderr, "no NTT prime for k=%d\n", k); return 2; }
+    const u32 p = primes[0];
+    const u32 n0 = mont_n0(p);
+    const u32 ln = (u32)k;
+
+    // host roots / tables (normal domain, then converted to Montgomery)
+    const u32 psi = find_psi(p, N);
+    const u32 omega = (u32)mulmod(psi, psi, p);
+    const u32 omega_inv = (u32)modinv(omega, p);
+    const u32 psi_inv = (u32)modinv(psi, p);
+    const u32 ninv_mont = to_mont((u32)modinv(N % p, p), p);
+
+    std::vector<u32> Wfwd(N / 2), Winv(N / 2), WJ(N), WIJ(N);
+    { u64 w = 1; for (u64 t = 0; t < N / 2; ++t) { Wfwd[t] = to_mont((u32)w, p); w = mulmod(w, omega, p); } }
+    { u64 w = 1; for (u64 t = 0; t < N / 2; ++t) { Winv[t] = to_mont((u32)w, p); w = mulmod(w, omega_inv, p); } }
+    { u64 w = 1; for (u64 j = 0; j < N; ++j) { WJ[j]  = to_mont((u32)w, p); w = mulmod(w, psi, p); } }
+    { u64 w = 1; for (u64 j = 0; j < N; ++j) { WIJ[j] = to_mont((u32)w, p); w = mulmod(w, psi_inv, p); } }
+
+    // random digit vector in [0,p)
+    std::vector<u32> x(N);
+    std::mt19937 rng(0xABCDEF ^ (unsigned)k);
+    for (u64 j = 0; j < N; ++j) x[j] = rng() % p;
+
+    std::vector<u32> ref = negasq_cpu(x, p, N);   // ground truth (this prime, mod p)
+
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) { fprintf(stderr, "no Metal device\n"); return 2; }
+        NSError* err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kKernelSource]
+                                               options:nil error:&err];
+        if (!lib) { fprintf(stderr, "compile failed: %s\n", err.localizedDescription.UTF8String); return 2; }
+        auto pso_for = [&](const char* name) -> id<MTLComputePipelineState> {
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+            id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
+            if (!ps) { fprintf(stderr, "pso %s failed: %s\n", name, err.localizedDescription.UTF8String); exit(2); }
+            return ps;
+        };
+        id<MTLComputePipelineState> psWeight = pso_for("k_weight");
+        id<MTLComputePipelineState> psBitrev = pso_for("k_bitrev");
+        id<MTLComputePipelineState> psStage  = pso_for("k_stage");
+        id<MTLComputePipelineState> psSq     = pso_for("k_sq");
+        id<MTLComputePipelineState> psFinal  = pso_for("k_final");
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+
+        auto buf = [&](const void* src, size_t bytes) {
+            return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
+                       : [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        };
+        std::vector<u32> xm(N);
+        for (u64 j = 0; j < N; ++j) xm[j] = to_mont(x[j], p);
+        id<MTLBuffer> bX    = buf(xm.data(),  N * sizeof(u32));
+        id<MTLBuffer> bT    = buf(nullptr,    N * sizeof(u32));
+        id<MTLBuffer> bWf   = buf(Wfwd.data(), Wfwd.size() * sizeof(u32));
+        id<MTLBuffer> bWi   = buf(Winv.data(), Winv.size() * sizeof(u32));
+        id<MTLBuffer> bWJ   = buf(WJ.data(),  N * sizeof(u32));
+        id<MTLBuffer> bWIJ  = buf(WIJ.data(), N * sizeof(u32));
+
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        // one encoder per dispatch; Metal hazard-tracks shared buffers between
+        // encoders in a command buffer, so this serialises the transform stages.
+        auto dispatch = [&](id<MTLComputePipelineState> ps, NSUInteger threads,
+                            void (^setup)(id<MTLComputeCommandEncoder>)) {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:ps];
+            setup(enc);
+            NSUInteger t = ps.maxTotalThreadsPerThreadgroup;
+            if (t > threads) t = threads;
+            [enc dispatchThreads:MTLSizeMake(threads, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(t, 1, 1)];
+            [enc endEncoding];
+        };
+
+        // 1. weight by psi^j
+        dispatch(psWeight, N, ^(id<MTLComputeCommandEncoder> e) {
+            [e setBuffer:bX offset:0 atIndex:0]; [e setBuffer:bWJ offset:0 atIndex:1];
+            [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+        });
+        // 2. bit-reverse bX -> bT
+        dispatch(psBitrev, N, ^(id<MTLComputeCommandEncoder> e) {
+            [e setBuffer:bX offset:0 atIndex:0]; [e setBuffer:bT offset:0 atIndex:1];
+            [e setBytes:&ln length:4 atIndex:2];
+        });
+        // 3. forward stages on bT
+        u32 nn = (u32)N;
+        for (u32 len = 2; len <= (u32)N; len <<= 1) {
+            u32 L = len;
+            dispatch(psStage, N / 2, ^(id<MTLComputeCommandEncoder> e) {
+                [e setBuffer:bT offset:0 atIndex:0]; [e setBuffer:bWf offset:0 atIndex:1];
+                [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                [e setBytes:&L length:4 atIndex:4]; [e setBytes:&nn length:4 atIndex:5];
+            });
+        }
+        // 4. pointwise square
+        dispatch(psSq, N, ^(id<MTLComputeCommandEncoder> e) {
+            [e setBuffer:bT offset:0 atIndex:0];
+            [e setBytes:&p length:4 atIndex:1]; [e setBytes:&n0 length:4 atIndex:2];
+        });
+        // 5. bit-reverse bT -> bX
+        dispatch(psBitrev, N, ^(id<MTLComputeCommandEncoder> e) {
+            [e setBuffer:bT offset:0 atIndex:0]; [e setBuffer:bX offset:0 atIndex:1];
+            [e setBytes:&ln length:4 atIndex:2];
+        });
+        // 6. inverse stages on bX
+        for (u32 len = 2; len <= (u32)N; len <<= 1) {
+            u32 L = len;
+            dispatch(psStage, N / 2, ^(id<MTLComputeCommandEncoder> e) {
+                [e setBuffer:bX offset:0 atIndex:0]; [e setBuffer:bWi offset:0 atIndex:1];
+                [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                [e setBytes:&L length:4 atIndex:4]; [e setBytes:&nn length:4 atIndex:5];
+            });
+        }
+        // 7. 1/N + unweight + fromMont
+        dispatch(psFinal, N, ^(id<MTLComputeCommandEncoder> e) {
+            [e setBuffer:bX offset:0 atIndex:0]; [e setBuffer:bWIJ offset:0 atIndex:1];
+            [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+            [e setBytes:&ninv_mont length:4 atIndex:4];
+        });
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.error) { fprintf(stderr, "GPU error: %s\n", cb.error.localizedDescription.UTF8String); return 2; }
+
+        const u32* G = (const u32*)bX.contents;
+        int fail = 0;
+        for (u64 j = 0; j < N; ++j) {
+            if (G[j] != ref[j]) {
+                if (fail < 5) printf("  MISMATCH j=%llu got %u want %u\n",
+                                     (unsigned long long)j, G[j], ref[j]);
+                ++fail;
+            }
+        }
+        printf("Metal device: %s\n", dev.name.UTF8String);
+        printf("ntt self-test: k=%d N=%llu p=%u  single-prime negacyclic square\n",
+               k, (unsigned long long)N, p);
+        printf("  GPU vs CPU reference: %s (%d/%llu mismatches)\n",
+               fail == 0 ? "OK" : "FAIL", fail, (unsigned long long)N);
+        return fail == 0 ? 0 : 1;
+    }
+}
+
 int main(int argc, char** argv) {
     int k = 16;
     std::string mode;
@@ -214,6 +494,7 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "Usage: %s --selftest montmul [--k K]\n", argv[0]); return 2; }
     }
     if (mode == "montmul") return selftest_montmul(k);
-    fprintf(stderr, "Usage: %s --selftest montmul [--k K]\n", argv[0]);
+    if (mode == "ntt")     return selftest_ntt(k);
+    fprintf(stderr, "Usage: %s --selftest {montmul|ntt} [--k K]\n", argv[0]);
     return 2;
 }
