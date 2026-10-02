@@ -1,5 +1,6 @@
-# CMake build directory
+# CMake build directories (build, build-release, build-mxnl, ...)
 build/
+build-*/
 
 # Compiled binaries (in-tree fallback)
 /hgfn_sieve
