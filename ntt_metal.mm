@@ -30,6 +30,8 @@
 
 using u32 = uint32_t;
 using u64 = uint64_t;
+using i64 = int64_t;
+using i128 = __int128;          // host coefficient path (Apple Silicon native)
 
 // ---------------------------------------------------------------------------
 // Host-side modular helpers (plain u64; these are setup/reference, not hot path)
@@ -211,6 +213,28 @@ kernel void k_sq(device uint* X [[buffer(0)]],
                  uint g [[thread_position_in_grid]]) {
     uint a = X[g];
     X[g] = mont_mul(a, a, p, n0);
+}
+
+// Pointwise multiply A[g] *= B[g] (Montgomery domain).
+kernel void k_mul(device uint* A [[buffer(0)]],
+                  device const uint* B [[buffer(1)]],
+                  constant uint& p [[buffer(2)]], constant uint& n0 [[buffer(3)]],
+                  uint g [[thread_position_in_grid]]) {
+    A[g] = mont_mul(A[g], B[g], p, n0);
+}
+
+// Load digits into the Montgomery domain and weight by psi^j in one pass.
+// IN holds normal-domain digits < p; WJ holds psi^j already in Montgomery form.
+// toMont(x) = REDC(x * R2); result = toMont(x) * WJ[g].
+kernel void k_load_weight(device const uint* IN [[buffer(0)]],
+                          device uint* OUT [[buffer(1)]],
+                          device const uint* WJ [[buffer(2)]],
+                          constant uint& p [[buffer(3)]], constant uint& n0 [[buffer(4)]],
+                          constant uint& r2 [[buffer(5)]],
+                          uint g [[thread_position_in_grid]]) {
+    uint x  = IN[g];
+    uint xm = redc(mulhi(x, r2), x * r2, p, n0);   // toMont
+    OUT[g]  = mont_mul(xm, WJ[g], p, n0);
 }
 
 // Finalize: X[g] = fromMont( X[g] * ninv * Wij[g] ).  ninv in Montgomery domain.
@@ -480,8 +504,306 @@ static int selftest_ntt(int k) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3 host helpers: NTT prime set by bound, balanced CRT, balanced base-b
+// carry with the b^N = -1 wrap, digit <-> mpz. (CRT/carry mirror ntt_ref.cpp.)
+// ---------------------------------------------------------------------------
+static std::vector<u32> ntt_primes_bound(u64 N, u64 b) {
+    std::vector<u32> out;
+    mpz_t bound, prod;
+    mpz_init(bound); mpz_init_set_ui(prod, 1);
+    mpz_set_ui(bound, (unsigned long)(b - 1));
+    mpz_mul(bound, bound, bound);
+    mpz_mul_ui(bound, bound, (unsigned long)N);
+    mpz_mul_ui(bound, bound, 2);                 // 2 * N * (b-1)^2
+    const u64 step = 2 * N;
+    for (u64 p = 1 + step; p < ((u64)1 << 31) && mpz_cmp(prod, bound) <= 0; p += step) {
+        if (b >= p) continue;
+        if (is_prime_u64(p)) { out.push_back((u32)p); mpz_mul_ui(prod, prod, (unsigned long)p); }
+    }
+    mpz_clear(bound); mpz_clear(prod);
+    return out;
+}
+
+// Extract a signed 128-bit value from an mpz (little-endian 32-bit chunks, so it
+// is independent of the platform's `long` width). |coeff| <= N*(b-1)^2 fits in
+// i128 for every realistic k/b (e.g. k=18, b~10^7 -> ~10^19 << 2^127).
+static i128 mpz_to_i128(const mpz_t x) {
+    int neg = mpz_sgn(x) < 0;
+    mpz_t t; mpz_init(t); mpz_abs(t, x);
+    unsigned __int128 v = 0;
+    for (int sh = 0; sh < 128 && mpz_sgn(t) != 0; sh += 32) {
+        uint32_t limb = (uint32_t)mpz_get_ui(t);
+        v |= ((unsigned __int128)limb) << sh;
+        mpz_fdiv_q_2exp(t, t, 32);
+    }
+    mpz_clear(t);
+    return neg ? -(i128)v : (i128)v;
+}
+
+// Balanced CRT of residues r[i] mod primes[i] -> signed coefficient (mpz Garner).
+static i128 crt_balanced(const std::vector<u32>& r, const std::vector<u32>& primes) {
+    const size_t m = primes.size();
+    mpz_t x, Macc, t, P_, half;
+    mpz_init_set_ui(x, r[0] % primes[0]);
+    mpz_init_set_ui(Macc, primes[0]);
+    mpz_init(t);
+    for (size_t i = 1; i < m; ++i) {
+        u64 pi = primes[i];
+        u64 xmod = mpz_fdiv_ui(x, (unsigned long)pi);
+        u64 inv = modinv(mpz_fdiv_ui(Macc, (unsigned long)pi), pi);
+        i64 dd = (i64)(r[i] % pi) - (i64)xmod;
+        dd %= (i64)pi; if (dd < 0) dd += (i64)pi;
+        u64 tt = mulmod((u64)dd, inv, pi);
+        mpz_mul_ui(t, Macc, (unsigned long)tt);
+        mpz_add(x, x, t);
+        mpz_mul_ui(Macc, Macc, (unsigned long)pi);
+    }
+    mpz_init(P_); mpz_set(P_, Macc);
+    mpz_init(half); mpz_fdiv_q_ui(half, P_, 2);
+    if (mpz_cmp(x, half) > 0) mpz_sub(x, x, P_);
+    i128 out = mpz_to_i128(x);
+    mpz_clear(x); mpz_clear(Macc); mpz_clear(t); mpz_clear(P_); mpz_clear(half);
+    return out;
+}
+
+// Balanced base-b carry with the b^N = -1 wrap. Coefficients arrive as i128
+// (they can exceed i64); the resulting digits are in (-b/2, b/2] and fit i64.
+static std::vector<i64> carry_balanced(const std::vector<i128>& c, u64 b) {
+    const i128 bb = (i128)b, half = bb / 2;
+    std::vector<i128> d = c;
+    const u64 N = d.size();
+    for (int guard = 0; guard < 128; ++guard) {
+        i128 carry = 0;
+        for (u64 j = 0; j < N; ++j) {
+            i128 v = d[j] + carry;
+            i128 rem = v % bb; if (rem < 0) rem += bb;
+            if (rem > half) rem -= bb;
+            carry = (v - rem) / bb;
+            d[j] = rem;
+        }
+        if (carry == 0) break;
+        d[0] -= carry;                 // b^N == -1
+    }
+    std::vector<i64> out(N);
+    for (u64 j = 0; j < N; ++j) out[j] = (i64)d[j];   // digits fit i64
+    return out;
+}
+
+static std::vector<i64> digits_vec_i64(const std::vector<u32>& x) {
+    return std::vector<i64>(x.begin(), x.end());
+}
+
+static void digits_to_mpz(mpz_t out, const std::vector<i64>& d, u64 b) {
+    mpz_set_ui(out, 0);
+    for (size_t j = d.size(); j-- > 0;) {
+        mpz_mul_ui(out, out, (unsigned long)b);
+        if (d[j] >= 0) mpz_add_ui(out, out, (unsigned long)d[j]);
+        else           mpz_sub_ui(out, out, (unsigned long)(-d[j]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 self-test: full multi-prime negacyclic multiply/square mod (b^N+1) on
+// the GPU (per-prime NTT channels) + CPU-side balanced CRT and carry, verified
+// against GMP x*y mod (b^N+1).
+// ---------------------------------------------------------------------------
+struct PrimeGPU {
+    u32 p, n0, r2, ninv_mont;
+    id<MTLBuffer> bWf, bWi, bWJ, bWIJ;
+};
+
+static int selftest_negamul(int k, u64 b, int reps) {
+    const u64 N = (u64)1 << k;
+    if ((b & 1) == 0 || b < 3) { fprintf(stderr, "need odd b >= 3\n"); return 2; }
+    std::vector<u32> primes = ntt_primes_bound(N, b);
+    if (primes.empty()) { fprintf(stderr, "no NTT primes for k=%d b=%llu\n", k,
+                                  (unsigned long long)b); return 2; }
+    const u32 ln = (u32)k;
+
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) { fprintf(stderr, "no Metal device\n"); return 2; }
+        NSError* err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kKernelSource]
+                                               options:nil error:&err];
+        if (!lib) { fprintf(stderr, "compile failed: %s\n", err.localizedDescription.UTF8String); return 2; }
+        auto pso_for = [&](const char* name) -> id<MTLComputePipelineState> {
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+            id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
+            if (!ps) { fprintf(stderr, "pso %s: %s\n", name, err.localizedDescription.UTF8String); exit(2); }
+            return ps;
+        };
+        id<MTLComputePipelineState> psLW  = pso_for("k_load_weight");
+        id<MTLComputePipelineState> psBR  = pso_for("k_bitrev");
+        id<MTLComputePipelineState> psST  = pso_for("k_stage");
+        id<MTLComputePipelineState> psSQ  = pso_for("k_sq");
+        id<MTLComputePipelineState> psMUL = pso_for("k_mul");
+        id<MTLComputePipelineState> psFIN = pso_for("k_final");
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+
+        auto mkbuf = [&](const void* src, size_t bytes) {
+            return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
+                       : [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        };
+
+        // Per-prime GPU tables (built once).
+        std::vector<PrimeGPU> G;
+        for (u32 p : primes) {
+            PrimeGPU g; g.p = p; g.n0 = mont_n0(p); g.r2 = mont_r2(p);
+            u32 psi = find_psi(p, N);
+            u32 omega = (u32)mulmod(psi, psi, p);
+            u32 omega_inv = (u32)modinv(omega, p);
+            u32 psi_inv = (u32)modinv(psi, p);
+            g.ninv_mont = to_mont((u32)modinv(N % p, p), p);
+            std::vector<u32> Wf(N / 2), Wi(N / 2), WJ(N), WIJ(N);
+            { u64 w = 1; for (u64 t = 0; t < N / 2; ++t) { Wf[t] = to_mont((u32)w, p); w = mulmod(w, omega, p); } }
+            { u64 w = 1; for (u64 t = 0; t < N / 2; ++t) { Wi[t] = to_mont((u32)w, p); w = mulmod(w, omega_inv, p); } }
+            { u64 w = 1; for (u64 j = 0; j < N; ++j) { WJ[j]  = to_mont((u32)w, p); w = mulmod(w, psi, p); } }
+            { u64 w = 1; for (u64 j = 0; j < N; ++j) { WIJ[j] = to_mont((u32)w, p); w = mulmod(w, psi_inv, p); } }
+            g.bWf = mkbuf(Wf.data(), Wf.size() * 4);
+            g.bWi = mkbuf(Wi.data(), Wi.size() * 4);
+            g.bWJ = mkbuf(WJ.data(), N * 4);
+            g.bWIJ = mkbuf(WIJ.data(), N * 4);
+            G.push_back(g);
+        }
+
+        // Scratch buffers (reused across primes).
+        // Separate input buffers for x and y: the CPU memcpy into a shared input
+        // buffer happens at encode time (before commit), so a single bIn would be
+        // clobbered by y before the GPU reads x. bW is GPU-written/read only, so
+        // Metal's hazard tracking serialises it safely across the two forwards.
+        id<MTLBuffer> bInX = mkbuf(nullptr, N * 4), bInY = mkbuf(nullptr, N * 4);
+        id<MTLBuffer> bW = mkbuf(nullptr, N * 4);
+        id<MTLBuffer> bFx = mkbuf(nullptr, N * 4), bFy = mkbuf(nullptr, N * 4);
+        id<MTLBuffer> bT  = mkbuf(nullptr, N * 4);
+        u32 nn = (u32)N;
+
+        // Run one negacyclic multiply/square on the GPU; returns N result digits
+        // (balanced) via CPU CRT + carry.
+        auto gpu_negamul = [&](const std::vector<u32>& x, const std::vector<u32>& y,
+                               bool squaring) -> std::vector<i64> {
+            std::vector<std::vector<u32>> cres(primes.size(), std::vector<u32>(N));
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            auto disp = [&](id<MTLComputePipelineState> ps, NSUInteger threads,
+                            void (^setup)(id<MTLComputeCommandEncoder>)) {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:ps]; setup(e);
+                NSUInteger t = ps.maxTotalThreadsPerThreadgroup; if (t > threads) t = threads;
+                [e dispatchThreads:MTLSizeMake(threads,1,1) threadsPerThreadgroup:MTLSizeMake(t,1,1)];
+                [e endEncoding];
+            };
+            auto forward = [&](PrimeGPU& g, const std::vector<u32>& src,
+                               id<MTLBuffer> bIn, id<MTLBuffer> dst) {
+                memcpy(bIn.contents, src.data(), N * 4);
+                id<MTLBuffer> WJ = g.bWJ, Wf = g.bWf; u32 p = g.p, n0 = g.n0, r2 = g.r2;
+                disp(psLW, N, ^(id<MTLComputeCommandEncoder> e){
+                    [e setBuffer:bIn offset:0 atIndex:0]; [e setBuffer:bW offset:0 atIndex:1];
+                    [e setBuffer:WJ offset:0 atIndex:2];
+                    [e setBytes:&p length:4 atIndex:3]; [e setBytes:&n0 length:4 atIndex:4];
+                    [e setBytes:&r2 length:4 atIndex:5];
+                });
+                disp(psBR, N, ^(id<MTLComputeCommandEncoder> e){
+                    [e setBuffer:bW offset:0 atIndex:0]; [e setBuffer:dst offset:0 atIndex:1];
+                    [e setBytes:&ln length:4 atIndex:2];
+                });
+                for (u32 len = 2; len <= nn; len <<= 1) { u32 L = len;
+                    disp(psST, N/2, ^(id<MTLComputeCommandEncoder> e){
+                        [e setBuffer:dst offset:0 atIndex:0]; [e setBuffer:Wf offset:0 atIndex:1];
+                        [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                        [e setBytes:&L length:4 atIndex:4]; [e setBytes:&nn length:4 atIndex:5];
+                    });
+                }
+            };
+            for (size_t pi = 0; pi < G.size(); ++pi) {
+                PrimeGPU& g = G[pi]; u32 p = g.p, n0 = g.n0, ninv = g.ninv_mont;
+                id<MTLBuffer> Wi = g.bWi, WIJ = g.bWIJ;
+                forward(g, x, bInX, bFx);
+                if (squaring) {
+                    disp(psSQ, N, ^(id<MTLComputeCommandEncoder> e){
+                        [e setBuffer:bFx offset:0 atIndex:0];
+                        [e setBytes:&p length:4 atIndex:1]; [e setBytes:&n0 length:4 atIndex:2];
+                    });
+                } else {
+                    forward(g, y, bInY, bFy);
+                    disp(psMUL, N, ^(id<MTLComputeCommandEncoder> e){
+                        [e setBuffer:bFx offset:0 atIndex:0]; [e setBuffer:bFy offset:0 atIndex:1];
+                        [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                    });
+                }
+                disp(psBR, N, ^(id<MTLComputeCommandEncoder> e){
+                    [e setBuffer:bFx offset:0 atIndex:0]; [e setBuffer:bT offset:0 atIndex:1];
+                    [e setBytes:&ln length:4 atIndex:2];
+                });
+                for (u32 len = 2; len <= nn; len <<= 1) { u32 L = len;
+                    disp(psST, N/2, ^(id<MTLComputeCommandEncoder> e){
+                        [e setBuffer:bT offset:0 atIndex:0]; [e setBuffer:Wi offset:0 atIndex:1];
+                        [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                        [e setBytes:&L length:4 atIndex:4]; [e setBytes:&nn length:4 atIndex:5];
+                    });
+                }
+                disp(psFIN, N, ^(id<MTLComputeCommandEncoder> e){
+                    [e setBuffer:bT offset:0 atIndex:0]; [e setBuffer:WIJ offset:0 atIndex:1];
+                    [e setBytes:&p length:4 atIndex:2]; [e setBytes:&n0 length:4 atIndex:3];
+                    [e setBytes:&ninv length:4 atIndex:4];
+                });
+                // channel result lands in bT; stash before it is reused next prime.
+                // (serialised: one command buffer per prime would also work, but we
+                //  read bT only after waitUntilCompleted, so copy out per prime via
+                //  a dedicated commit below.)
+                [cb commit]; [cb waitUntilCompleted];
+                if (cb.error) { fprintf(stderr, "GPU error: %s\n",
+                               cb.error.localizedDescription.UTF8String); exit(2); }
+                memcpy(cres[pi].data(), bT.contents, N * 4);
+                cb = [q commandBuffer];
+            }
+            // CPU: balanced CRT per coefficient, then balanced base-b carry.
+            std::vector<i128> c(N);
+            std::vector<u32> col(primes.size());
+            for (u64 j = 0; j < N; ++j) {
+                for (size_t pi = 0; pi < primes.size(); ++pi) col[pi] = cres[pi][j];
+                c[j] = crt_balanced(col, primes);
+            }
+            return carry_balanced(c, b);
+        };
+
+        printf("Metal device: %s\n", dev.name.UTF8String);
+        printf("negamul self-test: k=%d N=%llu b=%llu  %zu NTT primes  %d reps\n",
+               k, (unsigned long long)N, (unsigned long long)b, primes.size(), reps);
+
+        mpz_t BN1, X, Y, Z, GOT; mpz_inits(BN1, X, Y, Z, GOT, nullptr);
+        mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
+        std::mt19937 rng(0x5EED ^ (unsigned)k ^ (unsigned)b);
+        int fails = 0;
+        for (int r = 0; r < reps; ++r) {
+            std::vector<u32> x(N), y(N);
+            for (u64 j = 0; j < N; ++j) { x[j] = rng() % (u32)b; y[j] = rng() % (u32)b; }
+            std::vector<i64> dx = digits_vec_i64(x), dy = digits_vec_i64(y);
+            digits_to_mpz(X, dx, b); digits_to_mpz(Y, dy, b);
+
+            // multiply path
+            std::vector<i64> zm = gpu_negamul(x, y, false);
+            mpz_mul(Z, X, Y); mpz_mod(Z, Z, BN1);
+            digits_to_mpz(GOT, zm, b); mpz_mod(GOT, GOT, BN1);
+            if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  MUL mismatch rep %d\n", r); }
+
+            // square path
+            std::vector<i64> zs = gpu_negamul(x, x, true);
+            mpz_mul(Z, X, X); mpz_mod(Z, Z, BN1);
+            digits_to_mpz(GOT, zs, b); mpz_mod(GOT, GOT, BN1);
+            if (mpz_cmp(Z, GOT) != 0) { ++fails; if (fails <= 3) printf("  SQ mismatch rep %d\n", r); }
+        }
+        mpz_clears(BN1, X, Y, Z, GOT, nullptr);
+        printf("  GPU negamul vs GMP: %s (%d failures over %d reps x2 ops)\n",
+               fails == 0 ? "OK" : "FAIL", fails, reps);
+        return fails == 0 ? 0 : 1;
+    }
+}
+
 int main(int argc, char** argv) {
     int k = 16;
+    u64 b = 10001;
+    int reps = 8;
     std::string mode;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
@@ -491,10 +813,13 @@ int main(int argc, char** argv) {
         };
         if      (s == "--selftest") mode = nx("--selftest");
         else if (s == "--k")        k = atoi(nx("--k"));
-        else { fprintf(stderr, "Usage: %s --selftest montmul [--k K]\n", argv[0]); return 2; }
+        else if (s == "--b")        b = strtoull(nx("--b"), nullptr, 10);
+        else if (s == "--reps")     reps = atoi(nx("--reps"));
+        else { fprintf(stderr, "Usage: %s --selftest {montmul|ntt|negamul} [--k K] [--b B] [--reps R]\n", argv[0]); return 2; }
     }
-    if (mode == "montmul") return selftest_montmul(k);
-    if (mode == "ntt")     return selftest_ntt(k);
-    fprintf(stderr, "Usage: %s --selftest {montmul|ntt} [--k K]\n", argv[0]);
+    if (mode == "montmul")  return selftest_montmul(k);
+    if (mode == "ntt")      return selftest_ntt(k);
+    if (mode == "negamul")  return selftest_negamul(k, b, reps);
+    fprintf(stderr, "Usage: %s --selftest {montmul|ntt|negamul} [--k K] [--b B] [--reps R]\n", argv[0]);
     return 2;
 }
