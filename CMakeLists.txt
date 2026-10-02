@@ -109,9 +109,15 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(prp_cuda prp_cuda.cu)
     target_link_libraries(prp_cuda PRIVATE GMP::GMP)
     target_compile_features(prp_cuda PRIVATE cxx_std_17)
+    # Stage 2 of the large-k engine: negacyclic NTT transform on the GPU,
+    # validated bit-for-bit vs GMP (see docs/cuda-largek-prp.md).
+    add_executable(ntt_cuda ntt_cuda.cu)
+    target_link_libraries(ntt_cuda PRIVATE GMP::GMP)
+    target_compile_features(ntt_cuda PRIVATE cxx_std_17)
+
     # Default to Ada (RTX 4060); override with -DCMAKE_CUDA_ARCHITECTURES=...
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set_target_properties(prp_cuda PROPERTIES CUDA_ARCHITECTURES "89")
+        set_target_properties(prp_cuda ntt_cuda PROPERTIES CUDA_ARCHITECTURES "89")
     endif()
 else()
     message(STATUS "No CUDA compiler found -- skipping prp_cuda (build it on the NVIDIA box).")
