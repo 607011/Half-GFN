@@ -92,6 +92,23 @@ if(APPLE)
     endif()
 endif()
 
+# Optional: CUDA PRP test for NVIDIA GPUs (e.g. RTX 4060, Ada = sm_89), Regime A.
+# Built only when a CUDA compiler is present, so the macOS build is unaffected.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    add_executable(prp_cuda prp_cuda.cu)
+    target_link_libraries(prp_cuda PRIVATE GMP::GMP)
+    target_compile_features(prp_cuda PRIVATE cxx_std_17)
+    # Default to Ada (RTX 4060); override with -DCMAKE_CUDA_ARCHITECTURES=...
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(prp_cuda PROPERTIES CUDA_ARCHITECTURES "89")
+    endif()
+else()
+    message(STATUS "No CUDA compiler found -- skipping prp_cuda (build it on the NVIDIA box).")
+endif()
+
 # Stage 3 (prove.sh) needs PARI/GP's `gp` binary at runtime, not at build time.
 find_program(GP_EXECUTABLE gp)
 if(NOT GP_EXECUTABLE)
