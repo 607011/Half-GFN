@@ -35,7 +35,15 @@
 #include <filesystem>
 
 using u64 = uint64_t;
+
+// 128-bit helper for mulmod. GCC/Clang have a native __int128; MSVC does not,
+// so there we fall back to the x64 wide-multiply/divide intrinsics below.
+#if defined(__SIZEOF_INT128__)
+#define HGFN_HAVE_U128 1
 using u128 = unsigned __int128;
+#elif defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>  // _umul128, _udiv128
+#endif
 
 // Set by the SIGINT/SIGTERM handler: next block boundary -> checkpoint + exit.
 static volatile std::sig_atomic_t g_stop = 0;
@@ -47,7 +55,29 @@ static void on_signal(int) {
 // Modular arithmetic
 // ---------------------------------------------------------------------------
 static inline u64 mulmod(u64 a, u64 b, u64 m) {
+#if defined(HGFN_HAVE_U128)
     return (u64)((u128)a * b % m);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    // 128-bit product, then 128-by-64 divide for the remainder. _udiv128
+    // requires the high dividend < divisor, so reduce it mod m first.
+    u64 hi;
+    u64 lo = _umul128(a, b, &hi);
+    u64 rem;
+    _udiv128(hi % m, lo, m, &rem);
+    return rem;
+#else
+    // Portable fallback: double-and-add mulmod (no 128-bit type needed).
+    u64 r = 0;
+    a %= m;
+    while (b) {
+        if (b & 1) {
+            r = (r + a) % m;
+        }
+        a = (a << 1) % m;
+        b >>= 1;
+    }
+    return r;
+#endif
 }
 
 static inline u64 powmod(u64 a, u64 e, u64 m) {
@@ -118,33 +148,35 @@ static u64 primitive_2N_root(u64 p, u64 N) {
 
 // ---------------------------------------------------------------------------
 // Strike algebraically composite bases up front:  b = c^e (e >= 3 odd).
-// Then b^N + 1 is divisible by c^N + 1. Overflow-safe via __int128.
+// Then b^N + 1 is divisible by c^N + 1. Overflow-safe via a pre-multiply
+// divide check, so no 128-bit type is needed here.
 // ---------------------------------------------------------------------------
 static void strike_odd_powers(std::vector<uint8_t>& alive, int64_t b0, int64_t bmax) {
+    const u64 limit = (u64)bmax;
     for (int e = 3; ; e += 2) {
-        // 3^e <= bmax ?  (overflow-safe)
-        u128 t = 1;
+        // 3^e <= bmax ?  (overflow-safe: stop before t*3 could exceed bmax)
+        u64 t = 1;
         bool too_big = false;
         for (int i = 0; i < e; ++i) {
-            t *= 3;
-            if (t > (u128)bmax) {
+            if (t > limit / 3) {
                 too_big = true;
                 break;
             }
+            t *= 3;
         }
         if (too_big) {
             break;
         }
 
         for (int64_t c = 3; ; c += 2) {
-            u128 b = 1;
+            u64 b = 1;
             bool over = false;
             for (int i = 0; i < e; ++i) {
-                b *= (u128)c;
-                if (b > (u128)bmax) {
+                if (b > limit / (u64)c) {
                     over = true;
                     break;
                 }
+                b *= (u64)c;
             }
             if (over) {
                 break;
