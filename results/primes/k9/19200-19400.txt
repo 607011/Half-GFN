@@ -1,0 +1,3 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [19200,19400)
+19349
+19369

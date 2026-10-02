@@ -1,0 +1,3 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [58600,58800)
+58649
+58757

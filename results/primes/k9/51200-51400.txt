@@ -1,0 +1,2 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [51200,51400)
+51229

@@ -1,0 +1,4 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [60400,60600)
+60475
+60541
+60599

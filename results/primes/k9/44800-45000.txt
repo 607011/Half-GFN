@@ -1,0 +1,2 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [44800,45000)
+44879

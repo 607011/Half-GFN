@@ -1,0 +1,3 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [12200,12400)
+12391
+12395

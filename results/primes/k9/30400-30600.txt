@@ -1,0 +1,2 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [30400,30600)
+30567

@@ -1,0 +1,3 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [3600,3800)
+3627
+3631

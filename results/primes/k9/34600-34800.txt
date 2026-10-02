@@ -1,0 +1,4 @@
+# proven primes: b with (b^512+1)/2 prime (aprcl), block [34600,34800)
+34663
+34681
+34687
