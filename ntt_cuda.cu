@@ -108,6 +108,80 @@ __global__ void k_unweight(u64* __restrict__ C, const u64* __restrict__ wij,
     C[j] = d_mulmod(d_mulmod(C[j], ninv, p), wij[j], p);
 }
 
+// ===========================================================================
+// Resident (on-GPU) path: CRT and balanced carry as kernels, so the whole
+// powering loop stays on the device (no host round-trip per squaring).
+// ===========================================================================
+
+// Weight an i64 digit vector (balanced, possibly negative) by psi^j.
+__global__ void k_weight_i64(const i64* __restrict__ x, const u64* __restrict__ wj,
+                             u64* __restrict__ A, int N, u64 p) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    i64 r = x[j] % (i64)p; if (r < 0) r += (i64)p;
+    A[j] = d_mulmod((u64)r, wj[j], p);
+}
+
+// Balanced multi-prime CRT per coefficient, pure 64-bit (nvcc has no __int128 on
+// the MSVC host). Garner mixed-radix digits d[i], then balance only the TOP
+// digit: since the prime product exceeds 2*|coeff|max, that yields the true
+// signed value. Reconstruction c = sum d[t]*W_t is done wrapping mod 2^64 --
+// valid because the true |coeff| < 2^62 fits i64, so the low 64 bits are exact.
+#define HGFN_MAXP 8
+__global__ void k_crt(u64* const* __restrict__ dC, const u64* __restrict__ primes,
+                      const u64* __restrict__ ginv, int m, i64* __restrict__ out, int N) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    u64 d[HGFN_MAXP];
+    d[0] = dC[0][j] % primes[0];
+    for (int i = 1; i < m; ++i) {
+        u64 pI = primes[i];
+        u64 sum = 0, w = 1;                          // xi = (sum_{t<i} d[t] W_t) mod p_i
+        for (int t = 0; t < i; ++t) {
+            sum = (sum + (d[t] % pI) * w) % pI;
+            w = (w * (primes[t] % pI)) % pI;
+        }
+        i64 diff = (i64)(dC[i][j] % pI) - (i64)sum; diff %= (i64)pI; if (diff < 0) diff += (i64)pI;
+        d[i] = ((u64)diff * ginv[i]) % pI;          // ginv[i] = inv(W_i mod p_i)
+    }
+    i64 dtop = (i64)d[m - 1];
+    if (dtop > (i64)(primes[m - 1] / 2)) dtop -= (i64)primes[m - 1];   // balance top
+    u64 w = 1; i64 c = 0;                            // reconstruct mod 2^64
+    for (int t = 0; t < m - 1; ++t) { c += (i64)((u64)d[t] * w); w *= primes[t]; }
+    c += (i64)((u64)dtop * w);
+    out[j] = c;
+}
+
+// One balanced-carry iteration, phase 1: split e[j] into a balanced digit and
+// the carry `hi` that must move to position j+1 (with the b^N=-1 wrap at top).
+__global__ void k_carry_split(const i64* __restrict__ e, i64* __restrict__ digit,
+                              i64* __restrict__ hi, int N, i64 b) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    i64 v = e[j];
+    i64 rem = v % b; if (rem < 0) rem += b;
+    if (rem > b / 2) rem -= b;                     // balanced digit in (-b/2, b/2]
+    digit[j] = rem;
+    hi[j] = (v - rem) / b;                          // exact
+}
+// Phase 2: e[j] = digit[j] + incoming carry (hi[j-1]); position 0 gets -hi[N-1].
+__global__ void k_carry_combine(i64* __restrict__ e, const i64* __restrict__ digit,
+                                const i64* __restrict__ hi, int N) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    e[j] = digit[j] + (j == 0 ? -hi[N - 1] : hi[j - 1]);
+}
+
+__global__ void k_set_unit(i64* __restrict__ d, int N) {   // d = 1
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < N) d[j] = (j == 0) ? 1 : 0;
+}
+
+__global__ void k_any_nonzero(const i64* __restrict__ hi, int N, int* __restrict__ flag) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < N && hi[j] != 0) *flag = 1;        // benign race: all writers write 1
+}
+
 // ---------------------------------------------------------------------------
 // Per-prime plan (device buffers live for the program's lifetime)
 // ---------------------------------------------------------------------------
@@ -124,6 +198,14 @@ struct Plan {
     int k; u64 N, b;
     std::vector<u64> primes;
     std::vector<PrimePlan> pp;
+    // resident-path device state
+    u64*  dPrimes = nullptr;     // primes[m]
+    u64*  dGinv   = nullptr;     // Garner inverses inv((p0..p_{i-1}) mod p_i)
+    u64** dCptrs  = nullptr;     // device array of the m per-prime dC pointers
+    i64*  dCoef   = nullptr;     // CRT output (signed coefficients)
+    i64*  dDigit  = nullptr;     // carry scratch
+    i64*  dHi     = nullptr;     // carry scratch
+    int*  dFlag   = nullptr;     // carry-convergence flag (device)
 };
 
 static bool is_prime_u64(u64 n) {
@@ -183,6 +265,28 @@ static Plan make_plan(int k, u64 b) {
         CUDA_OK(cudaMalloc(&pp.dP, nb));
         P.pp.push_back(pp);
     }
+
+    // resident-path setup: primes, Garner inverses, dC pointer array, scratch
+    const int m = (int)P.primes.size();
+    std::vector<u64> ginv(m, 0);
+    for (int i = 1; i < m; ++i) {
+        u64 pi = P.primes[i];
+        u64 prod = 1;                                    // (p0..p_{i-1}) mod p_i
+        for (int t = 0; t < i; ++t) prod = h_mulmod(prod, P.primes[t] % pi, pi);
+        ginv[i] = h_modinv(prod, pi);
+    }
+    CUDA_OK(cudaMalloc(&P.dPrimes, m * sizeof(u64)));
+    CUDA_OK(cudaMemcpy(P.dPrimes, P.primes.data(), m * sizeof(u64), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMalloc(&P.dGinv, m * sizeof(u64)));
+    CUDA_OK(cudaMemcpy(P.dGinv, ginv.data(), m * sizeof(u64), cudaMemcpyHostToDevice));
+    std::vector<u64*> cptrs(m);
+    for (int i = 0; i < m; ++i) cptrs[i] = P.pp[i].dC;
+    CUDA_OK(cudaMalloc(&P.dCptrs, m * sizeof(u64*)));
+    CUDA_OK(cudaMemcpy(P.dCptrs, cptrs.data(), m * sizeof(u64*), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMalloc(&P.dCoef,  N * sizeof(i64)));
+    CUDA_OK(cudaMalloc(&P.dDigit, N * sizeof(i64)));
+    CUDA_OK(cudaMalloc(&P.dHi,    N * sizeof(i64)));
+    CUDA_OK(cudaMalloc(&P.dFlag,  sizeof(int)));
     return P;
 }
 
@@ -285,6 +389,87 @@ static std::vector<i64> negamul_gpu(const std::vector<i64>& x,
     return d;
 }
 
+// Resident negacyclic multiply/square: digit vectors live on the device as i64.
+// dX, dY -> dOut, all device pointers; squaring when dX == dY. Nothing touches
+// host memory. The per-prime transform reuses the same kernels as the host path.
+static void negamul_resident(const i64* dX, const i64* dY, i64* dOut, Plan& P) {
+    const int N = (int)P.N; const i64 b = (i64)P.b;
+    const int m = (int)P.primes.size();
+    const bool squaring = (dX == dY);
+    const int tpb = 256, g = (N + tpb - 1) / tpb, gh = (N / 2 + tpb - 1) / tpb;
+    (void)gh;
+    for (int pi = 0; pi < m; ++pi) {
+        PrimePlan& pp = P.pp[pi]; u64 p = pp.p;
+        k_weight_i64<<<g, tpb>>>(dX, pp.dWj, pp.dA, N, p);
+        ntt_device(pp.dA, pp, N, false, tpb);
+        if (squaring) {
+            k_pointwise_sq<<<g, tpb>>>(pp.dC, pp.dA, N, p);
+        } else {
+            k_weight_i64<<<g, tpb>>>(dY, pp.dWj, pp.dB, N, p);
+            ntt_device(pp.dB, pp, N, false, tpb);
+            k_pointwise_mul<<<g, tpb>>>(pp.dC, pp.dA, pp.dB, N, p);
+        }
+        ntt_device(pp.dC, pp, N, true, tpb);
+        k_unweight<<<g, tpb>>>(pp.dC, pp.dWij, N, p, pp.ninv);
+    }
+    k_crt<<<g, tpb>>>(P.dCptrs, P.dPrimes, P.dGinv, m, P.dCoef, N);
+    // parallel balanced carry: iterate until no carry remains. Each pass moves
+    // carries one position (with the b^N=-1 wrap); converges because it is just
+    // normalising a fixed residue. Cap guards against a logic error.
+    // Check convergence only every CHK passes: an extra (already-converged) pass
+    // is a harmless no-op (combine adds zero), so batching just trims host syncs.
+    const int cap = N + 64, CHK = 8;
+    for (int it = 0; it < cap; ++it) {
+        k_carry_split<<<g, tpb>>>(P.dCoef, P.dDigit, P.dHi, N, b);
+        if (it % CHK == CHK - 1 || it == cap - 1) {
+            CUDA_OK(cudaMemset(P.dFlag, 0, sizeof(int)));
+            k_any_nonzero<<<g, tpb>>>(P.dHi, N, P.dFlag);
+            int flag = 0;
+            CUDA_OK(cudaMemcpy(&flag, P.dFlag, sizeof(int), cudaMemcpyDeviceToHost));
+            if (!flag) break;                   // all e[j] already balanced digits
+        }
+        k_carry_combine<<<g, tpb>>>(P.dCoef, P.dDigit, P.dHi, N);
+    }
+    CUDA_OK(cudaMemcpy(dOut, P.dCoef, (size_t)N * sizeof(i64), cudaMemcpyDeviceToDevice));
+}
+
+// Resident powering: res = a^E mod (b^N+1), returned as host digit vector.
+// `time_ms` (if non-null) receives the GPU powering time.
+static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E,
+                                          Plan& P, double* time_ms) {
+    const int N = (int)P.N; const u64 b = P.b;
+    const int tpb = 256, g = (N + tpb - 1) / tpb;
+    // upload acc = a (as digits) and init res = 1
+    std::vector<i64> ad(N, 0);
+    { mpz_t t, q; mpz_init_set(t, a_red); mpz_init(q);
+      for (int j = 0; j < N; ++j) { u64 r = mpz_fdiv_q_ui(q, t, (unsigned long)b); ad[j] = (i64)r; mpz_set(t, q); }
+      mpz_clear(t); mpz_clear(q); }
+    i64 *dAcc, *dRes, *dTmp;
+    CUDA_OK(cudaMalloc(&dAcc, N * sizeof(i64)));
+    CUDA_OK(cudaMalloc(&dRes, N * sizeof(i64)));
+    CUDA_OK(cudaMalloc(&dTmp, N * sizeof(i64)));
+    CUDA_OK(cudaMemcpy(dAcc, ad.data(), N * sizeof(i64), cudaMemcpyHostToDevice));
+    k_set_unit<<<g, tpb>>>(dRes, N);
+
+    size_t bits = mpz_sizeinbase(E, 2);
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    CUDA_OK(cudaDeviceSynchronize()); cudaEventRecord(t0);
+    for (size_t i = bits; i-- > 0;) {
+        negamul_resident(dRes, dRes, dTmp, P); std::swap(dRes, dTmp);   // square
+        if (mpz_tstbit(E, (mp_bitcnt_t)i)) {
+            negamul_resident(dRes, dAcc, dTmp, P); std::swap(dRes, dTmp); // *a
+        }
+    }
+    cudaEventRecord(t1); CUDA_OK(cudaEventSynchronize(t1));
+    if (time_ms) { float ms = 0; cudaEventElapsedTime(&ms, t0, t1); *time_ms = ms; }
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    std::vector<i64> res(N);
+    CUDA_OK(cudaMemcpy(res.data(), dRes, N * sizeof(i64), cudaMemcpyDeviceToHost));
+    cudaFree(dAcc); cudaFree(dRes); cudaFree(dTmp);
+    return res;
+}
+
 // ---------------------------------------------------------------------------
 static void digits_to_mpz(mpz_t out, const std::vector<i64>& d, u64 b) {
     mpz_set_ui(out, 0);
@@ -304,6 +489,7 @@ static std::vector<i64> mpz_to_digits(const mpz_t x, u64 N, u64 b) {
 
 int main(int argc, char** argv) {
     int k = -1; u64 b = 0; unsigned long base_a = 3; bool selftest = false; int reps = 20;
+    bool resident = false;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) { if (i + 1 >= argc) { fprintf(stderr, "missing arg %s\n", f); exit(2);} return argv[++i]; };
@@ -311,8 +497,9 @@ int main(int argc, char** argv) {
         else if (s == "--b") b = strtoull(nx("--b"), nullptr, 10);
         else if (s == "--base") base_a = strtoul(nx("--base"), nullptr, 10);
         else if (s == "--selftest") selftest = true;
+        else if (s == "--resident") resident = true;
         else if (s == "--n") reps = atoi(nx("--n"));
-        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--selftest --n R]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "Usage: %s --k K --b B [--base A] [--resident] [--selftest --n R]\n", argv[0]); return 2; }
     }
     if (k < 1 || b < 3 || (b % 2) == 0) { fprintf(stderr, "Need --k>=1 and odd --b>=3.\n"); return 2; }
 
@@ -348,16 +535,30 @@ int main(int argc, char** argv) {
     mpz_sub_ui(Emo, M, 1);
     mpz_powm(ref, a_mpz, Emo, M);
     mpz_t a_red; mpz_init(a_red); mpz_mod(a_red, a_mpz, BN1);
-    std::vector<i64> acc = mpz_to_digits(a_red, N, b); mpz_clear(a_red);
-    std::vector<i64> res(N, 0); res[0] = 1;
-    size_t bits = mpz_sizeinbase(Emo, 2);
-    for (size_t i = bits; i-- > 0;) {
-        res = negamul_gpu(res, res, P);
-        if (mpz_tstbit(Emo, (mp_bitcnt_t)i)) res = negamul_gpu(res, acc, P);
+    std::vector<i64> res;
+    double tms = 0;
+    if (resident) {
+        res = powering_resident(a_red, Emo, P, &tms);
+    } else {
+        std::vector<i64> acc = mpz_to_digits(a_red, N, b);
+        res.assign(N, 0); res[0] = 1;
+        size_t bits = mpz_sizeinbase(Emo, 2);
+        for (size_t i = bits; i-- > 0;) {
+            res = negamul_gpu(res, res, P);
+            if (mpz_tstbit(Emo, (mp_bitcnt_t)i)) res = negamul_gpu(res, acc, P);
+        }
     }
+    mpz_clear(a_red);
     digits_to_mpz(got, res, b); mpz_mod(got, got, M);
     bool ok = (mpz_cmp(got, ref) == 0), prp = (mpz_cmp_ui(ref, 1) == 0);
-    printf("  match vs GMP: %s   |   M is %s\n", ok ? "YES" : "NO", prp ? "probable prime" : "composite");
+    printf("  match vs GMP: %s   |   M is %s%s", ok ? "YES" : "NO",
+           prp ? "probable prime" : "composite",
+           resident ? "" : "\n");
+    if (resident) {
+        size_t sq = mpz_sizeinbase(Emo, 2);
+        printf("   |   %s: %.1f ms  (%zu squarings, %.3f ms/sq)\n",
+               "GPU resident", tms, sq, tms / (double)sq);
+    }
     mpz_clears(BN1, M, a_mpz, ref, got, Emo, nullptr);
     return ok ? 0 : 1;
 }
