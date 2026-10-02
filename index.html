@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Half-GFN — hunting giant primes on your own machine</title>
 <meta name="description" content="A self-contained, ARM-native toolchain for hunting a special family of very large prime numbers — sieve, probable-prime test, and proof — built to run solo and offline.">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+    options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+  };
+</script>
+<script id="MathJax-script" async src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js"></script>
 <style>
   :root {
     --bg: #fbfaf7;
@@ -75,11 +82,10 @@
   }
   .formula {
     display: block; background: var(--code-bg); border: 1px solid var(--line);
-    border-radius: 10px; padding: 18px 20px; margin: 18px 0;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border-radius: 10px; padding: 14px 20px; margin: 18px 0;
     font-size: 19px; text-align: center; overflow-x: auto;
   }
-  .formula small { display:block; font-family: inherit; color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .formula small { display:block; color: var(--muted); font-size: 14px; margin-top: 6px; }
   .pipeline { display: grid; gap: 14px; margin: 20px 0; }
   @media (min-width: 620px) { .pipeline { grid-template-columns: 1fr 1fr 1fr; } }
   .stage {
@@ -134,23 +140,23 @@
     <h2><span class="n">1</span>The quarry: "halved" generalized Fermat numbers</h2>
     <p>Every number the project tests has the same shape:</p>
     <div class="formula">
-      M = (b<sup>N</sup> + 1) / 2 &nbsp;&nbsp;with&nbsp;&nbsp; N = 2<sup>k</sup>, &nbsp; b odd
-      <small>e.g. b = 3, k = 4 → N = 16 → (3¹⁶ + 1) / 2 = 21&nbsp;523&nbsp;361 (prime)</small>
+      \[ M = \frac{b^{N} + 1}{2}, \qquad N = 2^{k}, \quad b \text{ odd} \]
+      <small>e.g. \(b = 3,\ k = 4 \Rightarrow N = 16 \Rightarrow (3^{16} + 1)/2 = 21\,523\,361\) (prime)</small>
     </div>
-    <p>Unpack that in plain words. Take an odd number <code>b</code>, raise it to a power that is itself a
-    power of two (that is what <code>N = 2<sup>k</sup></code> means — 2, 4, 8, 16, 32 …), add one, and halve
-    the result. Because <code>b</code> is odd, <code>b<sup>N</sup>+1</code> is even, so the halving always
+    <p>Unpack that in plain words. Take an odd number \(b\), raise it to a power that is itself a
+    power of two (that is what \(N = 2^{k}\) means — 2, 4, 8, 16, 32 …), add one, and halve
+    the result. Because \(b\) is odd, \(b^{N}+1\) is even, so the halving always
     comes out whole.</p>
-    <p>Numbers of the form <code>b<sup>N</sup>+1</code> with a power-of-two exponent are called
+    <p>Numbers of the form \(b^{N}+1\) with a power-of-two exponent are called
     <strong>generalized Fermat numbers</strong>, a classic happy hunting ground for large primes. The twist
     here is the division by two — hence "half-GFN." That small change rules out the usual quick primality
     test for Fermat numbers, which is exactly what makes this family a fun, slightly off-the-beaten-path
     target to build your own tools for.</p>
     <p>Why these at all? Because the exponent being a power of two gives the numbers a very regular internal
     structure — and that structure is precisely what lets a clever sieve and a fast multiplication trick (both
-    below) chew through candidates that are otherwise far too big to test by brute force. Crank <code>k</code>
-    up and the numbers balloon fast: <code>k = 10</code> already means roughly 3&nbsp;000 decimal digits,
-    <code>k = 16</code> around 200&nbsp;000 digits.</p>
+    below) chew through candidates that are otherwise far too big to test by brute force. Crank \(k\)
+    up and the numbers balloon fast: \(k = 10\) already means roughly 3&nbsp;000 decimal digits,
+    \(k = 16\) around 200&nbsp;000 digits.</p>
   </section>
 
   <section>
@@ -198,10 +204,10 @@
     <p>And an FFT is exactly the kind of wide, repetitive arithmetic a GPU devours. So the heavy multiplication
     gets handed to the graphics card — using an <em>integer</em> variant of the transform (an NTT), which is
     exact to the last bit, no rounding to worry about. On an NVIDIA RTX 4060 the GPU engine overtakes a CPU
-    core at <code>k = 15</code>; on an Apple&nbsp;M2&nbsp;Pro, one step later at <code>k = 16</code>, and it
+    core at \(k = 15\); on an Apple&nbsp;M2&nbsp;Pro, one step later at \(k = 16\), and it
     keeps pulling ahead as the numbers grow:</p>
     <table class="bench">
-      <thead><tr><th>k (exponent 2ᵏ)</th><th>GPU vs. one CPU core</th></tr></thead>
+      <thead><tr><th>\(k\) (exponent \(2^{k}\))</th><th>GPU vs. one CPU core</th></tr></thead>
       <tbody>
         <tr><td>15</td><td>0.75×</td></tr>
         <tr><td>16</td><td class="win">1.08× — GPU wins</td></tr>
@@ -233,11 +239,11 @@
     <p>Run solo on ordinary hardware, the pipeline has already turned out a healthy pile of
     <em>proven</em> primes (not just probable ones):</p>
     <div class="stats">
-      <div class="stat"><div class="big">305,907</div><div class="lbl">proven primes at k = 4 (bases up to 21 million)</div></div>
-      <div class="stat"><div class="big">123,473</div><div class="lbl">proven primes at k = 5 (partial run)</div></div>
-      <div class="stat"><div class="big">k = 16</div><div class="lbl">where the GPU engine overtakes a CPU core</div></div>
+      <div class="stat"><div class="big">305,907</div><div class="lbl">proven primes at \(k = 4\) (bases up to 21 million)</div></div>
+      <div class="stat"><div class="big">123,473</div><div class="lbl">proven primes at \(k = 5\) (partial run)</div></div>
+      <div class="stat"><div class="big">\(k = 16\)</div><div class="lbl">where the GPU engine overtakes a CPU core</div></div>
     </div>
-    <p>The larger the exponent <code>k</code>, the rarer and the more expensive the primes become — and that
+    <p>The larger the exponent \(k\), the rarer and the more expensive the primes become — and that
     is where the GPU work earns its keep, and where the next experiments are headed.</p>
   </section>
 
