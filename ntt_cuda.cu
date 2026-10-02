@@ -281,6 +281,7 @@ struct Plan {
     i64*  dDigit  = nullptr;     // carry scratch
     i64*  dHi     = nullptr;     // carry scratch
     int*  dFlag   = nullptr;     // carry-convergence flag (device)
+    int   fixed_carry = 0;       // fixed carry passes per squaring (redundant digits)
 };
 
 static bool is_prime_u64(u64 n) {
@@ -312,10 +313,12 @@ static Plan make_plan(int k, u64 b) {
     Plan P; P.k = k; P.N = (u64)1 << k; P.b = b;
     const u64 N = P.N;
 
-    // choose primes p = j*2N+1 until product > 2*N*(b-1)^2
+    // choose primes p = j*2N+1 until product > 4*N*b^2. Uses b (not b-1) and a 4x
+    // margin: the resident path keeps *redundant* digits bounded by ~b (not fully
+    // balanced <= b/2), so convolution coefficients can reach ~N*b^2.
     mpz_t bound, prod; mpz_init(bound); mpz_init_set_ui(prod, 1);
-    mpz_set_ui(bound, (unsigned long)(b - 1)); mpz_mul(bound, bound, bound);
-    mpz_mul_ui(bound, bound, (unsigned long)N); mpz_mul_ui(bound, bound, 2);
+    mpz_set_ui(bound, (unsigned long)b); mpz_mul(bound, bound, bound);
+    mpz_mul_ui(bound, bound, (unsigned long)N); mpz_mul_ui(bound, bound, 4);
     const u64 step = 2 * N; u64 p = 1 + step;
     while (mpz_cmp(prod, bound) <= 0) {
         for (; p < (1u << 31); p += step) { if (b >= p) continue; if (is_prime_u64(p)) break; }
@@ -377,6 +380,12 @@ static Plan make_plan(int k, u64 b) {
     CUDA_OK(cudaMalloc(&P.dDigit, N * sizeof(i64)));
     CUDA_OK(cudaMalloc(&P.dHi,    N * sizeof(i64)));
     CUDA_OK(cudaMalloc(&P.dFlag,  sizeof(int)));
+
+    // Fixed carry passes per squaring (no host sync). Each pass shrinks the carry
+    // magnitude by ~b; ~log_b(2N) passes bring redundant digits back to ~b, which
+    // keeps the next convolution's coefficients within the CRT budget above. The
+    // final residue is fully normalised once, at the end (finalize_carry).
+    { int F = 0; u64 v = 2 * N; while (v > 0) { v /= b; ++F; } P.fixed_carry = F + 6; }
     return P;
 }
 
@@ -515,24 +524,31 @@ static void negamul_resident(const i64* dX, const i64* dY, i64* dOut, Plan& P) {
         k_unweight<<<g, tpb>>>(pp.dC, pp.dWij, N, p, pp.n0, pp.ninv_mont);
     }
     k_crt<<<g, tpb>>>(P.dCptrs, P.dPrimes, P.dGinv, m, P.dCoef, N);
-    // parallel balanced carry: iterate until no carry remains. Each pass moves
-    // carries one position (with the b^N=-1 wrap); converges because it is just
-    // normalising a fixed residue. Cap guards against a logic error.
-    // Check convergence only every CHK passes: an extra (already-converged) pass
-    // is a harmless no-op (combine adds zero), so batching just trims host syncs.
-    const int cap = N + 64, CHK = 8;
-    for (int it = 0; it < cap; ++it) {
+    // Fixed-pass balanced carry (NO host sync): just enough passes to pull the
+    // redundant digits back to ~b so the next convolution stays within the CRT
+    // budget. Digits are left redundant, not fully canonical -- the represented
+    // value is identical; the final residue is normalised once (finalize_carry).
+    for (int it = 0; it < P.fixed_carry; ++it) {
         k_carry_split<<<g, tpb>>>(P.dCoef, P.dDigit, P.dHi, N, b);
-        if (it % CHK == CHK - 1 || it == cap - 1) {
-            CUDA_OK(cudaMemset(P.dFlag, 0, sizeof(int)));
-            k_any_nonzero<<<g, tpb>>>(P.dHi, N, P.dFlag);
-            int flag = 0;
-            CUDA_OK(cudaMemcpy(&flag, P.dFlag, sizeof(int), cudaMemcpyDeviceToHost));
-            if (!flag) break;                   // all e[j] already balanced digits
-        }
         k_carry_combine<<<g, tpb>>>(P.dCoef, P.dDigit, P.dHi, N);
     }
     CUDA_OK(cudaMemcpy(dOut, P.dCoef, (size_t)N * sizeof(i64), cudaMemcpyDeviceToDevice));
+}
+
+// Fully normalise a residue to balanced base-b digits (convergence-checked, with
+// a host sync). Called once at the end of a powering, not per squaring.
+static void finalize_carry(Plan& P, i64* dBuf) {
+    const int N = (int)P.N; const i64 b = (i64)P.b;
+    const int tpb = 256, g = (N + tpb - 1) / tpb, cap = N + 64;
+    for (int it = 0; it < cap; ++it) {
+        k_carry_split<<<g, tpb>>>(dBuf, P.dDigit, P.dHi, N, b);
+        CUDA_OK(cudaMemset(P.dFlag, 0, sizeof(int)));
+        k_any_nonzero<<<g, tpb>>>(P.dHi, N, P.dFlag);
+        int flag = 0;
+        CUDA_OK(cudaMemcpy(&flag, P.dFlag, sizeof(int), cudaMemcpyDeviceToHost));
+        if (!flag) break;
+        k_carry_combine<<<g, tpb>>>(dBuf, P.dDigit, P.dHi, N);
+    }
 }
 
 // Checkpoint format: a small header (identifying the exact problem) + the next
@@ -617,6 +633,7 @@ static std::vector<i64> powering_resident(const mpz_t a_red, const mpz_t E, Plan
             }
         }
     }
+    finalize_carry(P, dRes);                 // redundant digits -> canonical, once
     cudaEventRecord(t1); CUDA_OK(cudaEventSynchronize(t1));
     if (time_ms) { float ms = 0; cudaEventElapsedTime(&ms, t0, t1); *time_ms = ms; }
     cudaEventDestroy(t0); cudaEventDestroy(t1);
