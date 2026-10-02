@@ -55,6 +55,9 @@ endif()
 add_library(hgfn_flags INTERFACE)
 if(MSVC)
     target_compile_options(hgfn_flags INTERFACE /W3)
+    # fopen() is ISO C and used portably (fopen_s is MSVC-only); silence the
+    # MSVC-specific C4996 deprecation warning instead of forking the code.
+    target_compile_definitions(hgfn_flags INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(hgfn_flags INTERFACE -Wall)
     if(HGFN_NATIVE)
