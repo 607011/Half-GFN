@@ -116,6 +116,48 @@ __global__ void k_stage_dif(u64* __restrict__ A, const u64* __restrict__ W,
     A[i + half] = mont_mul((u + p - v) % p, W[stride * t], p, n0);
 }
 
+// Multi-stage shared-memory kernels: one block owns a contiguous TILE of the
+// array and runs several stages locally (one launch instead of log2(TILE)). The
+// small-stride stages (len <= TILE) are self-contained within a tile because the
+// tile base is a multiple of TILE (hence of len). Twiddle index uses the full-N
+// stride N/len and the within-half position t, exactly as the global kernels.
+// DIT variant: runs stages len = 2 .. TILE (used after the large-stride stages).
+__global__ void k_stages_shared_dit(u64* __restrict__ A, const u64* __restrict__ W,
+                                    int N, u64 p, uint32_t n0, int TILE) {
+    extern __shared__ u64 sh[];
+    int base = blockIdx.x * TILE;
+    for (int t = threadIdx.x; t < TILE; t += blockDim.x) sh[t] = A[base + t];
+    __syncthreads();
+    for (int len = 2; len <= TILE; len <<= 1) {
+        int half = len / 2, stride = N / len;
+        for (int bid = threadIdx.x; bid < TILE / 2; bid += blockDim.x) {
+            int blk = bid / half, t = bid % half, i = blk * len + t;
+            u64 u = sh[i], v = mont_mul(sh[i + half], W[stride * t], p, n0);
+            sh[i] = (u + v) % p; sh[i + half] = (u + p - v) % p;
+        }
+        __syncthreads();
+    }
+    for (int t = threadIdx.x; t < TILE; t += blockDim.x) A[base + t] = sh[t];
+}
+// DIF variant: runs stages len = TILE .. 2 (used before the large-stride stages).
+__global__ void k_stages_shared_dif(u64* __restrict__ A, const u64* __restrict__ W,
+                                    int N, u64 p, uint32_t n0, int TILE) {
+    extern __shared__ u64 sh[];
+    int base = blockIdx.x * TILE;
+    for (int t = threadIdx.x; t < TILE; t += blockDim.x) sh[t] = A[base + t];
+    __syncthreads();
+    for (int len = TILE; len >= 2; len >>= 1) {
+        int half = len / 2, stride = N / len;
+        for (int bid = threadIdx.x; bid < TILE / 2; bid += blockDim.x) {
+            int blk = bid / half, t = bid % half, i = blk * len + t;
+            u64 u = sh[i], v = sh[i + half];
+            sh[i] = (u + v) % p; sh[i + half] = mont_mul((u + p - v) % p, W[stride * t], p, n0);
+        }
+        __syncthreads();
+    }
+    for (int t = threadIdx.x; t < TILE; t += blockDim.x) A[base + t] = sh[t];
+}
+
 __global__ void k_pointwise_sq(u64* __restrict__ C, const u64* __restrict__ A,
                                int N, u64 p, uint32_t n0) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -343,14 +385,21 @@ static Plan make_plan(int k, u64 b) {
 // order with NO explicit bit-reversal and NO extra buffer copy. The pointwise step
 // in between operates on bit-reversed data, which is fine (it is elementwise).
 static void ntt_device(u64* dBuf, const PrimePlan& pp, int N, bool inverse, int tpb) {
-    int blocks = (N / 2 + tpb - 1) / tpb;
+    const int TILE = (N < 2048) ? N : 2048;        // intra-tile stages fold into 1 launch
+    const int nblk_tile = N / TILE;
+    const size_t shb = (size_t)TILE * sizeof(u64);
+    const int blocks = (N / 2 + tpb - 1) / tpb;
     if (!inverse) {
-        for (int len = N; len >= 2; len >>= 1) {
+        // DIF: large-stride stages (len > TILE) global, then intra-tile stages in shared mem
+        for (int len = N; len > TILE; len >>= 1) {
             int half = len / 2, stride = N / len;
             k_stage_dif<<<blocks, tpb>>>(dBuf, pp.dW, N, pp.p, pp.n0, stride, half, len);
         }
+        k_stages_shared_dif<<<nblk_tile, tpb, shb>>>(dBuf, pp.dW, N, pp.p, pp.n0, TILE);
     } else {
-        for (int len = 2; len <= N; len <<= 1) {
+        // DIT: intra-tile stages in shared mem, then large-stride stages global
+        k_stages_shared_dit<<<nblk_tile, tpb, shb>>>(dBuf, pp.dWinv, N, pp.p, pp.n0, TILE);
+        for (int len = 2 * TILE; len <= N; len <<= 1) {
             int half = len / 2, stride = N / len;
             k_stage<<<blocks, tpb>>>(dBuf, pp.dWinv, N, pp.p, pp.n0, stride, half, len);
         }

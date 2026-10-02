@@ -179,12 +179,21 @@ residue. Required, not optional:
 6. **[TODO] Integrate** behind the same CLI/journal contract as `prp_test` so the
    pipeline (sieve → PRP → prove) can route large k to the GPU.
 
-**Top remaining optimisation (performance).** The engine is launch-bound: each
-squaring issues ~`#primes × 2 × log2(N)` stage launches. A **multi-stage
-shared-memory NTT** (fold ~log2(tile) stages into one kernel via a shared-memory
-tile, plus a four-/six-step decomposition for the large strides) would cut launches
-by ~5–10× and move the crossover well below k=17. This is the clear next step; plain
-Montgomery/arithmetic speedups do not help (already confirmed overhead-bound).
+**Performance status.** A **multi-stage shared-memory NTT** is now in: the
+small-stride stages (len ≤ 2048) run in one kernel per transform via a shared-memory
+tile, cutting stage launches ~2–3×. It preserves correctness but moved the crossover
+only marginally (still k=17), which localises the remaining floor to **kernel-launch
+latency + the carry's per-batch host sync**, not the NTT stages. The next levers, in
+order of expected payoff:
+1. **Carry without host syncs** — replace the convergence check (a device→host flag
+   copy every few passes) with a fixed, provably-sufficient pass count or a
+   device-side fixpoint, removing the serialising syncs from every squaring.
+2. **Large-stride stages via a four-/six-step decomposition** so those also run in
+   shared memory (one more launch reduction).
+3. **Batch the whole squaring into fewer kernels** (fuse weight→NTT and
+   NTT→pointwise boundaries).
+
+Montgomery/arithmetic speedups do not help here (confirmed overhead-bound).
 
 ---
 
