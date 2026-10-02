@@ -6,7 +6,11 @@ digits. The existing `prp_cuda.cu` (one thread per candidate) is a medium-k
 prototype and loses to the CPU at every size (see [`../BENCHMARKS.md`](../BENCHMARKS.md));
 this is a separate engine, not an evolution of that kernel.
 
-Status: design only. Nothing here is built yet.
+Status: **implemented and working** in `ntt_cuda.cu` (stages 1–3, Montgomery, and
+checkpoint/resume done; benchmarked). The GPU beats a single CPU core from **k = 17**
+up (see [`../BENCHMARKS.md`](../BENCHMARKS.md)). Remaining: a multi-stage
+shared-memory NTT to lower the crossover, and Gerbicz–Li error checking. The stage
+checklist in §7 marks what is done.
 
 ---
 
@@ -159,21 +163,28 @@ residue. Required, not optional:
 
 ## 7. Staged implementation plan
 
-1. **Host reference.** CPU negacyclic-NTT squaring mod `b^N+1` in plain C++
-   (int64/__int128 or GMP for CRT). Validate `a^(M-1) mod M` against `prp_test`
-   for k=4…10. This nails the math before any CUDA.
-2. **Single-prime GPU NTT.** Port the length-N NTT + pointwise + carry to CUDA for
-   one prime, small N. Validate against the host reference.
-3. **Multi-prime + CRT.** Add the 2–3 prime CRT reconstruction; push N up to k=16.
-4. **Powering + GEC + checkpoint.** Full `a^(M-1)` chain with Gerbicz–Li and
-   resumable checkpoints.
-5. **Benchmark vs. CPU** at k=12, 14, 16, 18; find the crossover k where the GPU
-   overtakes 20-thread GMP; set the routing threshold. Record in `BENCHMARKS.md`.
-6. **Integrate** behind the same CLI/journal contract as `prp_test` so the
-   pipeline (sieve → PRP → prove) is unchanged.
+1. **[DONE] Host reference** (`ntt_ref.cpp`). CPU negacyclic-NTT squaring mod
+   `b^N+1`, validated bit-exact vs GMP for k=4…10 (`tests/ntt_ref_sweep.sh`).
+2. **[DONE] GPU NTT** (`ntt_cuda.cu`). Length-N transform (weight / NTT /
+   pointwise / unweight) as kernels, validated vs GMP.
+3. **[DONE] Multi-prime + CRT + resident** . On-GPU balanced CRT and parallel
+   carry; the whole `a^(M-1)` powering stays on the device (`--resident`).
+   Validated bit-exact vs GMP k=4…11, 2- and 3-prime regimes.
+4. **[PARTIAL] Powering + GEC + checkpoint.** Montgomery modmul **[done]**;
+   checkpoint/resume **[done]**, bit-exact (`--ckpt`). Gerbicz–Li error check
+   **[todo]** — non-trivial for the arbitrary exponent `M-1` (not a pure power of
+   two), so it needs the block-check generalisation, not the plain Pépin form.
+5. **[DONE] Benchmark vs. CPU.** k=14…18 measured; crossover at **k=17** (GPU vs
+   one GMP core). Recorded in `BENCHMARKS.md`.
+6. **[TODO] Integrate** behind the same CLI/journal contract as `prp_test` so the
+   pipeline (sieve → PRP → prove) can route large k to the GPU.
 
-Each stage has a concrete pass/fail gate (match the reference / beat the previous
-stage), so progress is measurable.
+**Top remaining optimisation (performance).** The engine is launch-bound: each
+squaring issues ~`#primes × 2 × log2(N)` stage launches. A **multi-stage
+shared-memory NTT** (fold ~log2(tile) stages into one kernel via a shared-memory
+tile, plus a four-/six-step decomposition for the large strides) would cut launches
+by ~5–10× and move the crossover well below k=17. This is the clear next step; plain
+Montgomery/arithmetic speedups do not help (already confirmed overhead-bound).
 
 ---
 

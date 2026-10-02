@@ -62,3 +62,54 @@ beating the CPU; keep it only as a correctness oracle / medium-k convenience. Th
 large-k target (k ≥ 16, numbers of ~10^5–10^6 digits) requires a different
 paradigm: one big squaring spread across the whole GPU via FFT/NTT. See
 [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md).
+
+---
+
+## 2026-10-02 — large-k NTT engine (`ntt_cuda --resident`): GPU beats CPU at k ≥ 17
+
+**Question.** Does the resident NTT engine (whole-GPU-per-squaring, the design in
+`docs/cuda-largek-prp.md`) beat the CPU for large k?
+
+**Hardware.** RTX 4060 (Ada, `sm_89`), CUDA 13.4, vs Intel i5-14500. **Single CPU
+core** this time: at large k each candidate is one huge number and GMP is not
+multithreaded for a single squaring, so GPU (whole device) vs one GMP core is the
+correct per-candidate comparison. Montgomery modmul, forward-DIF/inverse-DIT NTT,
+on-GPU CRT + balanced carry; base b = 9 (2 NTT primes). Per modular squaring:
+
+| k | N = 2^k | \|M\| bits | GPU ms/sq | CPU (1 core GMP) ms/sq | speedup |
+|---|--------:|-----------:|----------:|-----------------------:|:-------:|
+| 14 | 16 384  | 51 936     | 1.72      | 0.22                   | 0.13×   |
+| 15 | 32 768  | 103 872    | 2.17      | 0.66                   | 0.30×   |
+| 16 | 65 536  | 207 744    | 2.69      | 1.73                   | 0.64×   |
+| 17 | 131 072 | 415 488    | 3.29      | 3.69                   | **1.12×** |
+| 18 | 262 144 | 830 976    | 3.48      | 8.56                   | **2.46×** |
+
+**Result.** The crossover is **k = 17**: the GPU overtakes a CPU core there and by
+k = 18 is ~2.5× ahead; the lead keeps growing with k (CPU per-squaring cost grows
+faster than the GPU's). The full powering is validated bit-exact vs GMP
+(`mpz_powm`) for k ≤ 11 (larger k take too long to oracle directly, but share the
+identical, validated kernels).
+
+**Diagnosis — overhead-bound, not compute-bound.** Adding Montgomery modmul and
+removing the bit-reversal + buffer copy (DIF/DIT) barely moved the GPU numbers.
+The floor (~1.5 ms/sq, nearly flat from k=12 to k=14) is **kernel-launch
+overhead**: each squaring issues ~#primes × 2 transforms × log2(N) stage launches
+plus the carry passes. So the way to lower the crossover below k=17 is *fewer
+launches* — a multi-stage shared-memory NTT kernel (fold ~log2(tile) stages per
+launch) — not faster arithmetic.
+
+**Reliability.** `--ckpt FILE [--ckpt-int N]` checkpoints the residue + exponent
+position atomically and resumes bit-exact (verified by stopping at 1500 squarings
+and resuming to a GMP-matching result), so multi-hour k ≥ 17 runs survive crashes.
+
+**Reproduce.**
+```bash
+cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+cmake --build build-release --target ntt_cuda
+for k in 14 15 16 17 18; do ./build-release/ntt_cuda --bench 60 --k $k --b 9; done
+```
+
+**Remaining work** (see `docs/cuda-largek-prp.md` §7): multi-stage shared-memory NTT
+to cut launches (lowers the crossover and speeds every k); Gerbicz–Li error
+checking for silent-error detection on long runs.
