@@ -19,3 +19,7 @@ primes.txt
 
 # Persistent proof journals (intra-block checkpoints)
 .proofwork/
+
+# Banked sieve candidates: bulk, cheaply reproducible -> keep local, not in git.
+# (The coverage ledger still records which ranges were sieved and how many survived.)
+results/candidates/
