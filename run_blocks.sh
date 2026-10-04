@@ -65,16 +65,36 @@ mkdir -p .proofwork "results/primes/k$K"
 [ -f results/primes.tsv ] || \
     printf '# date\tk\tblock_start\tblock_end\tn_primes\tmax_digits\tmethod\tcommit\thost\n' > results/primes.tsv
 
-# --- Pre-scan: which blocks in [FROM,TO) are already proved (in coverage.tsv)? ---
-# OVERWRITE=1 means recompute them (overwrite); 0 means skip them (resume).
+# --- Pre-scan: which blocks in [FROM,TO) already have results in coverage.tsv? ---
+# Matched on the exact (k, block_start, block_end), so a different block size with
+# the same start does NOT count as this block. A block is "done" once its proof is
+# recorded; "partial" means sieve and/or PRP are recorded but the proof is not.
+# OVERWRITE=1 means recompute done blocks (overwrite); 0 means skip them (resume).
 OVERWRITE=0
 done_blocks=()
+partial_blocks=()
 for (( s=FROM; s<TO; s+=BLOCK )); do
-    if awk -F'\t' -v k="$K" -v st="$s" \
-        '$2==k && $3==st && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
-        done_blocks+=( "$s" )
-    fi
+    e=$(( s + BLOCK ))
+    stages=$(awk -F'\t' -v k="$K" -v st="$s" -v en="$e" \
+        '$2==k && $3==st && $4==en { seen[$5]=1 } END { for (x in seen) printf "%s ", x }' \
+        coverage.tsv 2>/dev/null)
+    case " $stages " in
+        *" proof "*)            done_blocks+=( "$s" ) ;;
+        *" sieve "*|*" prp "*)  partial_blocks+=( "$s" ) ;;
+    esac
 done
+
+# (a) Report blocks with partial results (sieve/PRP present, proof pending). They
+# are recomputed either way (no proof yet) -- this is informational only.
+if [ "${#partial_blocks[@]}" -gt 0 ]; then
+    echo "note: ${#partial_blocks[@]} block(s) in [$FROM,$TO) have partial results" \
+         "(sieve/PRP recorded, proof pending) and will be (re)computed:"
+    show=6; [ "${#partial_blocks[@]}" -lt "$show" ] && show="${#partial_blocks[@]}"
+    for (( i=0; i<show; i++ )); do
+        ps="${partial_blocks[$i]}"; echo "  k=$K block [$ps,$((ps+BLOCK)))"
+    done
+    [ "${#partial_blocks[@]}" -gt "$show" ] && echo "  ... and $(( ${#partial_blocks[@]} - show )) more"
+fi
 
 if [ "${#done_blocks[@]}" -gt 0 ]; then
     first="${done_blocks[0]}"; last="${done_blocks[${#done_blocks[@]}-1]}"
@@ -101,8 +121,8 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     bmin=$(( start + 1 )); [ "$start" -eq 0 ] && bmin=3
 
     # --- block level: already proved? -> skip, unless the user chose to overwrite ---
-    if [ "$OVERWRITE" -eq 0 ] && awk -F'\t' -v k="$K" -v s="$start" \
-        '$2==k && $3==s && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
+    if [ "$OVERWRITE" -eq 0 ] && awk -F'\t' -v k="$K" -v s="$start" -v e="$end" \
+        '$2==k && $3==s && $4==e && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
         echo "k=$K block [$start,$end): already proved -> skipped"
         continue
     fi

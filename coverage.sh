@@ -21,10 +21,10 @@
 #        e.g.  ./coverage.sh record 15 0 1000000 sieve plimit=1e9 80375
 #   ./coverage.sh status      # generate STATUS.md from coverage.tsv
 #   ./coverage.sh todo        # blocks with PRP done but proof pending
-#   ./coverage.sh claim   K BLOCK_START STAGE [TTL_HOURS]   # reserve a block
-#   ./coverage.sh renew   K BLOCK_START STAGE [TTL_HOURS]   # extend the lease
-#   ./coverage.sh release K BLOCK_START STAGE               # release the lease
-#   ./coverage.sh claims                                    # active reservations
+#   ./coverage.sh claim   K BLOCK_START BLOCK_END STAGE [TTL_HOURS]  # reserve a block
+#   ./coverage.sh renew   K BLOCK_START BLOCK_END STAGE [TTL_HOURS]  # extend the lease
+#   ./coverage.sh release K BLOCK_START BLOCK_END STAGE              # release the lease
+#   ./coverage.sh claims                                            # active reservations
 #
 # DISTRIBUTION WITHOUT DOUBLE WORK (several machines, git as the lock):
 #   1. git pull
@@ -53,18 +53,18 @@ ensure_ledger() {
 
 ensure_claims() {
     if [ ! -f "$CLAIMS" ]; then
-        printf '# claimed_epoch\tk\tblock_start\tstage\thost\texpires_epoch\n' > "$CLAIMS"
+        printf '# claimed_epoch\tk\tblock_start\tblock_end\tstage\thost\texpires_epoch\n' > "$CLAIMS"
     fi
 }
 
 # Append a claim line (claim/renew: expires = now + ttl; release: now).
 append_claim() {
-    local K="$1" BS="$2" STAGE="$3" EXPIRES="$4"
+    local K="$1" BS="$2" BE="$3" STAGE="$4" EXPIRES="$5"
     local now host
     now=$(date +%s)
     host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "-")
     ensure_claims
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$K" "$BS" "$STAGE" "$host" "$EXPIRES" >> "$CLAIMS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$K" "$BS" "$BE" "$STAGE" "$host" "$EXPIRES" >> "$CLAIMS"
 }
 
 cmd_record() {
@@ -92,42 +92,42 @@ cmd_record() {
 
 # Prints "host (Nh left)" if (k,block,stage) is currently actively claimed.
 active_claim() {
-    local K="$1" BS="$2" STAGE="$3"
+    local K="$1" BS="$2" BE="$3" STAGE="$4"
     [ -f "$CLAIMS" ] || return 0
-    awk -F'\t' -v k="$K" -v bs="$BS" -v st="$STAGE" -v now="$(date +%s)" '
+    awk -F'\t' -v k="$K" -v bs="$BS" -v be="$BE" -v st="$STAGE" -v now="$(date +%s)" '
         /^#/ { next }
-        $2==k && $3==bs && $4==st && ($1+0) >= ts { ts=$1+0; host=$5; xp=$6+0 }
+        $2==k && $3==bs && $4==be && $5==st && ($1+0) >= ts { ts=$1+0; host=$6; xp=$7+0 }
         END { if (xp > now) { printf "%s (%dh left)", host, int((xp-now)/3600) } }
     ' "$CLAIMS"
 }
 
 cmd_claim() {
-    [ $# -ge 3 ] || { echo "Usage: $0 claim K BLOCK_START STAGE [TTL_HOURS]" >&2; exit 2; }
-    local K="$1" BS="$2" STAGE="$3" ttl="${4:-$TTL_HOURS}"
+    [ $# -ge 4 ] || { echo "Usage: $0 claim K BLOCK_START BLOCK_END STAGE [TTL_HOURS]" >&2; exit 2; }
+    local K="$1" BS="$2" BE="$3" STAGE="$4" ttl="${5:-$TTL_HOURS}"
     case "$STAGE" in sieve|prp|proof) ;; *) echo "Unknown stage: $STAGE" >&2; exit 2 ;; esac
-    local info; info=$(active_claim "$K" "$BS" "$STAGE")
+    local info; info=$(active_claim "$K" "$BS" "$BE" "$STAGE")
     if [ -n "$info" ]; then
-        echo "Already claimed: k=$K block=$BS $STAGE by $info" >&2
+        echo "Already claimed: k=$K block=$BS-$BE $STAGE by $info" >&2
         echo "(use 'renew' on this host, or wait for the lease to lapse)" >&2
         exit 1
     fi
     local expires=$(( $(date +%s) + ttl * 3600 ))
-    append_claim "$K" "$BS" "$STAGE" "$expires"
-    echo "claimed: k=$K block=$BS $STAGE (lease ${ttl}h) -- now 'git push'"
+    append_claim "$K" "$BS" "$BE" "$STAGE" "$expires"
+    echo "claimed: k=$K block=$BS-$BE $STAGE (lease ${ttl}h) -- now 'git push'"
 }
 
 cmd_renew() {
-    [ $# -ge 3 ] || { echo "Usage: $0 renew K BLOCK_START STAGE [TTL_HOURS]" >&2; exit 2; }
-    local K="$1" BS="$2" STAGE="$3" ttl="${4:-$TTL_HOURS}"
+    [ $# -ge 4 ] || { echo "Usage: $0 renew K BLOCK_START BLOCK_END STAGE [TTL_HOURS]" >&2; exit 2; }
+    local K="$1" BS="$2" BE="$3" STAGE="$4" ttl="${5:-$TTL_HOURS}"
     local expires=$(( $(date +%s) + ttl * 3600 ))
-    append_claim "$K" "$BS" "$STAGE" "$expires"
-    echo "renewed: k=$K block=$BS $STAGE (lease +${ttl}h)"
+    append_claim "$K" "$BS" "$BE" "$STAGE" "$expires"
+    echo "renewed: k=$K block=$BS-$BE $STAGE (lease +${ttl}h)"
 }
 
 cmd_release() {
-    [ $# -ge 3 ] || { echo "Usage: $0 release K BLOCK_START STAGE" >&2; exit 2; }
-    append_claim "$1" "$2" "$3" "$(date +%s)"   # expires = now -> free immediately
-    echo "released: k=$1 block=$2 $3"
+    [ $# -ge 4 ] || { echo "Usage: $0 release K BLOCK_START BLOCK_END STAGE" >&2; exit 2; }
+    append_claim "$1" "$2" "$3" "$4" "$(date +%s)"   # expires = now -> free immediately
+    echo "released: k=$1 block=$2-$3 $4"
 }
 
 cmd_claims() {
@@ -135,14 +135,14 @@ cmd_claims() {
     echo "Active claims:"
     awk -F'\t' -v now="$(date +%s)" '
         /^#/ { next }
-        { key=$2 SUBSEP $3 SUBSEP $4; if (($1+0) >= ts[key]) { ts[key]=$1+0; host[key]=$5; xp[key]=$6+0 } }
+        { key=$2 SUBSEP $3 SUBSEP $4 SUBSEP $5; if (($1+0) >= ts[key]) { ts[key]=$1+0; host[key]=$6; xp[key]=$7+0 } }
         END {
             n=0;
             for (key in xp) {
                 if (xp[key] > now) {
                     split(key, a, SUBSEP);
-                    printf "  k=%s  block=%s  %s  ->  %s  (%dh left)\n",
-                           a[1], a[2], a[3], host[key], int((xp[key]-now)/3600);
+                    printf "  k=%s  block=%s-%s  %s  ->  %s  (%dh left)\n",
+                           a[1], a[2], a[3], a[4], host[key], int((xp[key]-now)/3600);
                     n++;
                 }
             }
@@ -164,7 +164,7 @@ cmd_status() {
             /^#/ { next }
             NF >= 6 {
                 k=$2; bs=$3; be=$4; st=$5; pa=$6; co=$7;
-                key=k SUBSEP bs; seen[key]=1; endv[key]=be;
+                key=k SUBSEP bs SUBSEP be; seen[key]=1;
                 if (st=="sieve")      { sieve[key]=pa (co!=""?" ("co")":"") }
                 else if (st=="prp")   { prp[key]=pa (co!=""?" ("co")":"") }
                 else if (st=="proof") { proof[key]=pa (co!=""?" ("co")":"") }
@@ -175,7 +175,7 @@ cmd_status() {
                     s = (key in sieve) ? sieve[key] : "—";
                     p = (key in prp)   ? prp[key]   : "—";
                     r = (key in proof) ? proof[key] : "—";
-                    printf "%s\t%s\t%s\t%s\t%s\t%s\n", a[1], a[2], endv[key], s, p, r;
+                    printf "%s\t%s\t%s\t%s\t%s\t%s\n", a[1], a[2], a[3], s, p, r;
                 }
             }
         ' "$LEDGER" | sort -t"$TAB" -k1,1n -k2,2n | awk -F'\t' '
@@ -203,13 +203,13 @@ cmd_todo() {
     awk -F'\t' -v now="$(date +%s)" '
         FNR==NR {
             if ($0 ~ /^#/) { next }
-            ck=$2 SUBSEP $3 SUBSEP $4;
-            if (($1+0) >= cts[ck]) { cts[ck]=$1+0; cexp[ck]=$6+0 }
+            ck=$2 SUBSEP $3 SUBSEP $4 SUBSEP $5;
+            if (($1+0) >= cts[ck]) { cts[ck]=$1+0; cexp[ck]=$7+0 }
             next
         }
         /^#/ { next }
         NF >= 6 {
-            key=$2 SUBSEP $3; endv[key]=$4;
+            key=$2 SUBSEP $3 SUBSEP $4;
             if ($5=="prp")   { hasprp[key]=1;   prpparams[key]=$6 }
             if ($5=="proof") { hasproof[key]=1 }
         }
@@ -218,9 +218,9 @@ cmd_todo() {
             for (key in hasprp) {
                 if (!(key in hasproof)) {
                     split(key, a, SUBSEP);
-                    ck=a[1] SUBSEP a[2] SUBSEP "proof";
+                    ck=a[1] SUBSEP a[2] SUBSEP a[3] SUBSEP "proof";
                     claimed = (ck in cexp && cexp[ck] > now) ? "  [claimed]" : "";
-                    printf "  k=%s  block=%s-%s  (%s)%s\n", a[1], a[2], endv[key], prpparams[key], claimed;
+                    printf "  k=%s  block=%s-%s  (%s)%s\n", a[1], a[2], a[3], prpparams[key], claimed;
                     n++;
                 }
             }
