@@ -20,8 +20,13 @@
 # Usage:
 #   ./run_blocks.sh --k K --from START --to END [options]
 # Options:
-#   --block SIZE   bases per block (default 1000000). Shrink it for large k,
-#                  where even one block of 1e6 would take far too long.
+#   --block SIZE   tiling granularity: SIZE bases per block (default 1000000). It
+#                  does NOT set the range -- that is --from/--to. SIZE only chops a
+#                  large range into per-block units (the unit of coverage records,
+#                  of block-level resume, and of a distributed 'claim'). Shrink it
+#                  for large k, where even one 1e6 block would take far too long.
+#                  For a single small range you can ignore it: the last block is
+#                  clamped to --to, so e.g. '--from 0 --to 100' yields one [0,100).
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
 #   --bases "..."  PRP bases (default: first 13 primes, "2 3 5 ... 41")
 #   --ecpp         prove with ECPP instead of APR-CL
@@ -34,8 +39,9 @@
 # overwrite. Answering no (or a non-interactive run without -y) keeps the existing
 # results and computes only the missing blocks. -y recomputes and overwrites all.
 #
-# Processes [START, END) in steps of --block. START/END/SIZE should be chosen so
-# the blocks tile consistently (multiples of SIZE).
+# Processes [START, END) in steps of --block; the final block is clamped to END,
+# so END is a true upper bound. For resumable multi-block sweeps, keep START and
+# SIZE aligned (START a multiple of SIZE) so blocks tile consistently across runs.
 #
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
@@ -83,7 +89,7 @@ OVERWRITE=0
 done_blocks=()
 partial_blocks=()
 for (( s=FROM; s<TO; s+=BLOCK )); do
-    e=$(( s + BLOCK ))
+    e=$(( s + BLOCK < TO ? s + BLOCK : TO ))   # clamp the last block to --to
     stages=$(awk -F'\t' -v k="$K" -v st="$s" -v en="$e" \
         '$2==k && $3==st && $4==en { seen[$5]=1 } END { for (x in seen) printf "%s ", x }' \
         coverage.tsv 2>/dev/null)
@@ -134,7 +140,7 @@ has_stage() {  # $1 = sieve|prp ; uses $K,$start,$end
 }
 
 for (( start=FROM; start<TO; start+=BLOCK )); do
-    end=$(( start + BLOCK ))
+    end=$(( start + BLOCK < TO ? start + BLOCK : TO ))   # clamp the last block to --to
     bmin=$(( start + 1 )); [ "$start" -eq 0 ] && bmin=3
 
     # --- block level: already proved? -> skip, unless the user chose to overwrite ---
