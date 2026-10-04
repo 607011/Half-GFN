@@ -8,6 +8,15 @@
 #   * intra-block: the proof uses a persistent journal (.proofwork/) so a run
 #     aborted mid-block only recomputes the one in-flight number.
 #
+# Reuse of banked artifacts (avoids recomputing finished stages):
+#   * sieve: if results/candidates/k<K>/<s>-<e>.txt exists AND its sieve row is in
+#     coverage.tsv, it is reused instead of re-sieving (e.g. a block pre-sieved by
+#     sieve_k10.sh). Sieve output is otherwise banked there (local, gitignored).
+#   * PRP: results/prp/k<K>/<s>-<e>.txt is the proof-queue staging file; reused if
+#     present (with its coverage row), and deleted once the block is proved.
+#   The coverage row is the completion marker, so a truncated file is never reused.
+#   -y forces a fresh recomputation (overwrites banked files).
+#
 # Usage:
 #   ./run_blocks.sh --k K --from START --to END [options]
 # Options:
@@ -61,7 +70,7 @@ if [ "$VERBOSE" -eq 1 ]; then exec 3>&1 4>&2; else exec 3>/dev/null 4>/dev/null;
 
 N=$(( 1 << K ))
 BASES_CSV=$(printf '%s' "$BASES" | tr ' ' ',')
-mkdir -p .proofwork "results/primes/k$K"
+mkdir -p .proofwork "results/primes/k$K" "results/candidates/k$K" "results/prp/k$K"
 [ -f results/primes.tsv ] || \
     printf '# date\tk\tblock_start\tblock_end\tn_primes\tmax_digits\tmethod\tcommit\thost\n' > results/primes.tsv
 
@@ -116,6 +125,14 @@ if [ "${#done_blocks[@]}" -gt 0 ]; then
     fi
 fi
 
+# A banked artifact is reused only if BOTH its file and its coverage row exist.
+# The coverage row is written only after a stage finishes, so this never reuses a
+# truncated/aborted file (which, for the sieve, could be missing real primes).
+has_stage() {  # $1 = sieve|prp ; uses $K,$start,$end
+    awk -F'\t' -v k="$K" -v s="$start" -v e="$end" -v st="$1" \
+        '$2==k && $3==s && $4==e && $5==st { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null
+}
+
 for (( start=FROM; start<TO; start+=BLOCK )); do
     end=$(( start + BLOCK ))
     bmin=$(( start + 1 )); [ "$start" -eq 0 ] && bmin=3
@@ -127,36 +144,52 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
         continue
     fi
 
-    # --- safety guard: the sieve is correct only if M(bmin) > plimit ---
-    if ! awk -v n="$N" -v b="$bmin" -v p="$PLIMIT" \
-        'BEGIN { exit (n*log(b) - log(2) > log(p)) ? 0 : 1 }'; then
-        echo "ERROR: plimit=$PLIMIT too large for k=$K, bmin=$bmin (M(bmin) <= plimit)." >&2
-        echo "The sieve could strike out real primes. Lower plimit." >&2
-        exit 1
-    fi
-
-    S=$(mktemp); P=$(mktemp); PR=$(mktemp)
+    cand_file="results/candidates/k$K/${start}-${end}.txt"
+    prp_file="results/prp/k$K/${start}-${end}.txt"
     journal=".proofwork/k${K}_${start}-${end}.done"
     # When overwriting an existing block, drop its proof journal so it is a full
     # fresh recomputation rather than a resume.
     [ "$OVERWRITE" -eq 1 ] && rm -f "$journal"
 
-    ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" --out "$S" >&3 2>&4
-    nsieve=$(grep -c '^[0-9]' "$S" || true); nsieve=${nsieve:-0}
+    # --- Stage 1: sieve (reuse banked candidates if present) ---
+    if [ "$OVERWRITE" -eq 0 ] && [ -f "$cand_file" ] && has_stage sieve; then
+        nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
+        echo "k=$K block [$start,$end): reusing banked candidates ($nsieve)"
+    else
+        # safety guard: the sieve is correct only if M(bmin) > plimit
+        if ! awk -v n="$N" -v b="$bmin" -v p="$PLIMIT" \
+            'BEGIN { exit (n*log(b) - log(2) > log(p)) ? 0 : 1 }'; then
+            echo "ERROR: plimit=$PLIMIT too large for k=$K, bmin=$bmin (M(bmin) <= plimit)." >&2
+            echo "The sieve could strike out real primes. Lower plimit." >&2
+            exit 1
+        fi
+        ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" \
+            --out "$cand_file.tmp" >&3 2>&4
+        mv -f "$cand_file.tmp" "$cand_file"      # atomic -> a banked file is always complete
+        nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
+        ./coverage.sh record "$K" "$start" "$end" sieve "plimit=$PLIMIT" "$nsieve" >/dev/null
+    fi
 
-    ./build/prp_test $VFLAG --bases "$BASES" "$S" --out "$P" >&3 2>&4
-    nprp=$(grep -c '^[0-9]' "$P" || true); nprp=${nprp:-0}
+    # --- Stage 2: PRP (reuse banked survivors if present) ---
+    if [ "$OVERWRITE" -eq 0 ] && [ -f "$prp_file" ] && has_stage prp; then
+        nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
+        echo "k=$K block [$start,$end): reusing banked PRP survivors ($nprp)"
+    else
+        ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" >&3 2>&4
+        mv -f "$prp_file.tmp" "$prp_file"
+        nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
+        ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV" "$nprp" >/dev/null
+    fi
 
-    # Proof with a persistent journal (intra-block checkpoint)
-    ./prove.sh $PROVE_FLAG --journal "$journal" "$P" --out "$PR" >&3 2>&4
+    # --- Stage 3: proof (always; persistent journal for intra-block resume) ---
+    PR=$(mktemp)
+    ./prove.sh $PROVE_FLAG --journal "$journal" "$prp_file" --out "$PR" >&3 2>&4
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
     { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start,$end)"
       grep '^[0-9]' "$PR" || true; } > "results/primes/k$K/${start}-${end}.txt"
 
-    ./coverage.sh record "$K" "$start" "$end" sieve "plimit=$PLIMIT" "$nsieve" >/dev/null
-    ./coverage.sh record "$K" "$start" "$end" prp   "bases=$BASES_CSV"  "$nprp"   >/dev/null
-    ./coverage.sh record "$K" "$start" "$end" proof "method=$METHOD"    "$nprimes" >/dev/null
+    ./coverage.sh record "$K" "$start" "$end" proof "method=$METHOD" "$nprimes" >/dev/null
 
     if [ "$nprimes" -gt 0 ]; then
         maxb=$(grep '^[0-9]' "$PR" | sort -n | tail -1)
@@ -168,6 +201,10 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$date" "$K" "$start" "$end" "$nprimes" "$dig" "$METHOD" "$commit" "$host" >> results/primes.tsv
 
-    rm -f "$S" "$P" "$PR" "$journal"   # block done -> drop the intra-block journal
+    # Block proved: drop the proof scratch, the PRP staging file (proof-queue
+    # convention: the verified result now lives in results/primes/) and the
+    # intra-block journal. Keep the banked candidates (reproducible, gitignored,
+    # reusable for a re-PRP with other bases).
+    rm -f "$PR" "$prp_file" "$journal"
     echo "k=$K block [$start,$end): sieve=$nsieve prp=$nprp primes=$nprimes (max $dig digits)"
 done
