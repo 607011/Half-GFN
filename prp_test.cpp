@@ -131,6 +131,7 @@ static bool test_candidate(unsigned long b, unsigned long exp,
 int main(int argc, char** argv) {
     std::string candfile, out = "prp.txt";
     std::string journal_path;
+    bool no_journal = false;
     long exp_override = -1;
     long limit = 0;
     int nthreads = (int)std::thread::hardware_concurrency();
@@ -167,15 +168,19 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (a == "--journal") {
             journal_path = next("--journal");
+        } else if (a == "--no-journal") {
+            no_journal = true;
         } else if (a == "-h" || a == "--help") {
             printf("Usage: %s [--exp N] [--bases \"2 3 5 ...\"] [--limit N] "
                    "[--out prp.txt] [--threads N] [-v|--verbose]\n"
-                   "       [--journal FILE] [candidate-file]\n"
+                   "       [--journal FILE | --no-journal] [candidate-file]\n"
                    "  --bases: default is the first 13 primes (2 3 5 ... 41).\n"
                    "  -v:      also report composite candidates.\n"
-                   "  --journal: every tested base is logged immediately; running\n"
-                   "             again with the same journal skips those bases\n"
-                   "             (resume). Ctrl-C exits cleanly.\n", argv[0]);
+                   "  --journal: ON by default -- without it, '<candidate-file>.journal'\n"
+                   "             is used. Every tested base is logged immediately; running\n"
+                   "             again with the same journal skips those bases (resume) and\n"
+                   "             the journal is removed once the run completes. Ctrl-C exits\n"
+                   "             cleanly, keeping the journal. --no-journal disables it.\n", argv[0]);
             return 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", a.c_str());
@@ -186,6 +191,13 @@ int main(int argc, char** argv) {
     }
     if (candfile.empty()) {
         candfile = "kand.txt";
+    }
+    // Journaling is on by default: without --journal, use "<candfile>.journal" so
+    // a resume is tied to this candidate set. --no-journal opts out.
+    if (no_journal) {
+        journal_path.clear();
+    } else if (journal_path.empty()) {
+        journal_path = candfile + ".journal";
     }
     if (bases.empty()) {
         // Default: the first 13 primes as strong-PRP bases. Composites almost
@@ -401,5 +413,10 @@ int main(int argc, char** argv) {
     printf("--------------------------------------------------------------------------\n");
     printf("Done in %.1f s. %zu bases tested in this run, %zu PRP total -> %s\n",
            secs, done.load(), prp_bases.size(), out.c_str());
+
+    // Completed successfully -> the journal is obsolete; remove it.
+    if (journaling && !journal_path.empty()) {
+        std::remove(journal_path.c_str());
+    }
     return 0;
 }

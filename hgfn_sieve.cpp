@@ -457,6 +457,7 @@ int main(int argc, char** argv) {
     double plimit_d = 1e8;
     std::string out = "candidates.txt";
     std::string ckpt_path;
+    bool no_checkpoint = false;
     double ckpt_interval = 60.0;
     std::string pause_file;
     int nthreads = (int)std::thread::hardware_concurrency();
@@ -487,6 +488,8 @@ int main(int argc, char** argv) {
             nthreads = atoi(next("--threads"));
         } else if (a == "--checkpoint") {
             ckpt_path = next("--checkpoint");
+        } else if (a == "--no-checkpoint") {
+            no_checkpoint = true;
         } else if (a == "--checkpoint-interval") {
             ckpt_interval = atof(next("--checkpoint-interval"));
         } else if (a == "--pause-file") {
@@ -496,8 +499,10 @@ int main(int argc, char** argv) {
         } else if (a == "-h" || a == "--help") {
             printf("Usage: %s --k K --bmax BMAX [--bmin 3] [--plimit 1e8] "
                    "[--out candidates.txt] [--threads N] [-v|--verbose]\n"
-                   "       [--checkpoint FILE] [--checkpoint-interval SEC] [--pause-file FILE]\n"
-                   "  If the checkpoint file exists, the run resumes automatically.\n"
+                   "       [--checkpoint FILE | --no-checkpoint] [--checkpoint-interval SEC] [--pause-file FILE]\n"
+                   "  Checkpointing is ON by default: without --checkpoint a default file\n"
+                   "  'sieve.k<k>.<bmin>-<bmax>.ckpt' is used; it resumes automatically if\n"
+                   "  present and is deleted once the sieve finishes. --no-checkpoint disables it.\n"
                    "  Ctrl-C writes a checkpoint at the next block boundary and exits.\n"
                    "  --pause-file: while the file exists, the sieve pauses at a block\n"
                    "                boundary (remove it to resume).\n"
@@ -517,6 +522,16 @@ int main(int argc, char** argv) {
         nthreads = 1;
     }
     u64 plimit = (u64)plimit_d;
+
+    // Checkpointing is on by default. Without an explicit --checkpoint, use a
+    // name derived from (k, bmin, bmax) so it only ever matches the same sieve
+    // (load_checkpoint aborts on a parameter mismatch). --no-checkpoint opts out.
+    if (no_checkpoint) {
+        ckpt_path.clear();
+    } else if (ckpt_path.empty()) {
+        ckpt_path = "sieve.k" + std::to_string(k) + "." +
+                    std::to_string(bmin) + "-" + std::to_string(bmax) + ".ckpt";
+    }
 
     // Catch Ctrl-C / kill cleanly -> checkpoint at the next block boundary.
     std::signal(SIGINT, on_signal);
@@ -556,5 +571,10 @@ int main(int argc, char** argv) {
     }
     fclose(f);
     printf("Candidates written to %s\n", out.c_str());
+
+    // Sieve finished successfully -> the checkpoint is obsolete; remove it.
+    if (!ckpt_path.empty()) {
+        std::remove(ckpt_path.c_str());
+    }
     return 0;
 }
