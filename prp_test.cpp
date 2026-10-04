@@ -30,11 +30,11 @@
 //   ./prp_test [options] [candidate-file]        (default: kand.txt)
 // Options:
 //   --exp N        override the exponent (otherwise from the header)
-//   --bases "a b"  PRP bases, space-separated (default "3")
+//   --bases "a b"  PRP bases, space-separated (default: first 13 primes, 2..41)
 //   --limit N      test only the first N candidates (0 = all)
 //   --out FILE     write the PRP bases here (default prp.txt)
 //   --threads N    threads (default: all cores)
-//   --verbose      also report composite candidates
+//   -v, --verbose  also report composite candidates
 
 #include <gmp.h>
 
@@ -163,14 +163,16 @@ int main(int argc, char** argv) {
             out = next("--out");
         } else if (a == "--threads") {
             nthreads = atoi(next("--threads").c_str());
-        } else if (a == "--verbose") {
+        } else if (a == "--verbose" || a == "-v") {
             verbose = true;
         } else if (a == "--journal") {
             journal_path = next("--journal");
         } else if (a == "-h" || a == "--help") {
-            printf("Usage: %s [--exp N] [--bases \"3 5 7\"] [--limit N] "
-                   "[--out prp.txt] [--threads N] [--verbose]\n"
+            printf("Usage: %s [--exp N] [--bases \"2 3 5 ...\"] [--limit N] "
+                   "[--out prp.txt] [--threads N] [-v|--verbose]\n"
                    "       [--journal FILE] [candidate-file]\n"
+                   "  --bases: default is the first 13 primes (2 3 5 ... 41).\n"
+                   "  -v:      also report composite candidates.\n"
                    "  --journal: every tested base is logged immediately; running\n"
                    "             again with the same journal skips those bases\n"
                    "             (resume). Ctrl-C exits cleanly.\n", argv[0]);
@@ -186,7 +188,14 @@ int main(int argc, char** argv) {
         candfile = "kand.txt";
     }
     if (bases.empty()) {
-        bases = {3};
+        // Default: the first 13 primes as strong-PRP bases. Composites almost
+        // always fail the first base (2), so the extra bases cost next to nothing
+        // (early-out) yet make a false "probable prime" vanishingly unlikely before
+        // the proof stage -- and are the strongest practical claim at large k where
+        // a full proof is infeasible. NB: these are *not* a deterministic witness
+        // set at these sizes (that only holds for n < 3.3e24); they are 13
+        // probabilistic rounds.
+        bases = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
     }
     if (nthreads < 1) {
         nthreads = 1;

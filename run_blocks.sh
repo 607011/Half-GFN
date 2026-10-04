@@ -14,9 +14,16 @@
 #   --block SIZE   bases per block (default 1000000). Shrink it for large k,
 #                  where even one block of 1e6 would take far too long.
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
-#   --bases "..."  PRP bases (default "3 5 7")
+#   --bases "..."  PRP bases (default: first 13 primes, "2 3 5 ... 41")
 #   --ecpp         prove with ECPP instead of APR-CL
+#   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
+#   -y | --yes     recompute/overwrite already-computed blocks without asking
 #   -h | --help
+#
+# If the requested range contains blocks that are already computed (present in
+# coverage.tsv), the script reports them and asks whether to recompute and
+# overwrite. Answering no (or a non-interactive run without -y) keeps the existing
+# results and computes only the missing blocks. -y recomputes and overwrites all.
 #
 # Processes [START, END) in steps of --block. START/END/SIZE should be chosen so
 # the blocks tile consistently (multiples of SIZE).
@@ -25,7 +32,9 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 BLOCK=1000000
-K=""; FROM=""; TO=""; PLIMIT="1e7"; BASES="3 5 7"; METHOD="aprcl"; PROVE_FLAG=""
+K=""; FROM=""; TO=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
+BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
+VERBOSE=0; VFLAG=""; ASSUME_YES=0
 
 usage() { awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
 
@@ -38,11 +47,17 @@ while [ $# -gt 0 ]; do
         --plimit) PLIMIT="$2"; shift 2 ;;
         --bases)  BASES="$2"; shift 2 ;;
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
+        -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
+        -y|--yes) ASSUME_YES=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "Unknown option: $1" >&2; usage 2 ;;
     esac
 done
 [ -n "$K" ] && [ -n "$FROM" ] && [ -n "$TO" ] || { echo "Error: --k, --from, --to required." >&2; usage 2; }
+
+# Diagnostic output of the called tools goes to fd 3/4: the terminal when -v is
+# set, otherwise /dev/null. The result files (--out) are unaffected either way.
+if [ "$VERBOSE" -eq 1 ]; then exec 3>&1 4>&2; else exec 3>/dev/null 4>/dev/null; fi
 
 N=$(( 1 << K ))
 BASES_CSV=$(printf '%s' "$BASES" | tr ' ' ',')
@@ -50,12 +65,43 @@ mkdir -p .proofwork "results/primes/k$K"
 [ -f results/primes.tsv ] || \
     printf '# date\tk\tblock_start\tblock_end\tn_primes\tmax_digits\tmethod\tcommit\thost\n' > results/primes.tsv
 
+# --- Pre-scan: which blocks in [FROM,TO) are already proved (in coverage.tsv)? ---
+# OVERWRITE=1 means recompute them (overwrite); 0 means skip them (resume).
+OVERWRITE=0
+done_blocks=()
+for (( s=FROM; s<TO; s+=BLOCK )); do
+    if awk -F'\t' -v k="$K" -v st="$s" \
+        '$2==k && $3==st && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
+        done_blocks+=( "$s" )
+    fi
+done
+
+if [ "${#done_blocks[@]}" -gt 0 ]; then
+    first="${done_blocks[0]}"; last="${done_blocks[${#done_blocks[@]}-1]}"
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        OVERWRITE=1
+        echo "note: ${#done_blocks[@]} block(s) in [$FROM,$TO) already computed -> recomputing and overwriting (-y)."
+    elif [ -t 0 ]; then
+        echo "k=$K: ${#done_blocks[@]} of the requested blocks are already computed" \
+             "(first start=$first, last start=$last)."
+        printf "Recompute and overwrite them? [y/N] "
+        read -r ans || ans=""
+        case "$ans" in
+            y|Y|yes|YES|Yes) OVERWRITE=1 ;;
+            *) OVERWRITE=0; echo "Keeping existing results; computing only the missing blocks." ;;
+        esac
+    else
+        echo "note: ${#done_blocks[@]} block(s) in [$FROM,$TO) already computed -> skipping them." \
+             "Use -y to recompute and overwrite." >&2
+    fi
+fi
+
 for (( start=FROM; start<TO; start+=BLOCK )); do
     end=$(( start + BLOCK ))
     bmin=$(( start + 1 )); [ "$start" -eq 0 ] && bmin=3
 
-    # --- block level: already proved? -> skip ---
-    if awk -F'\t' -v k="$K" -v s="$start" \
+    # --- block level: already proved? -> skip, unless the user chose to overwrite ---
+    if [ "$OVERWRITE" -eq 0 ] && awk -F'\t' -v k="$K" -v s="$start" \
         '$2==k && $3==s && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
         echo "k=$K block [$start,$end): already proved -> skipped"
         continue
@@ -71,15 +117,18 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
 
     S=$(mktemp); P=$(mktemp); PR=$(mktemp)
     journal=".proofwork/k${K}_${start}-${end}.done"
+    # When overwriting an existing block, drop its proof journal so it is a full
+    # fresh recomputation rather than a resume.
+    [ "$OVERWRITE" -eq 1 ] && rm -f "$journal"
 
-    ./build/hgfn_sieve --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" --out "$S" >/dev/null 2>&1
+    ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" --out "$S" >&3 2>&4
     nsieve=$(grep -c '^[0-9]' "$S" || true); nsieve=${nsieve:-0}
 
-    ./build/prp_test --bases "$BASES" "$S" --out "$P" >/dev/null 2>&1
+    ./build/prp_test $VFLAG --bases "$BASES" "$S" --out "$P" >&3 2>&4
     nprp=$(grep -c '^[0-9]' "$P" || true); nprp=${nprp:-0}
 
     # Proof with a persistent journal (intra-block checkpoint)
-    ./prove.sh $PROVE_FLAG --journal "$journal" "$P" --out "$PR" >/dev/null 2>&1
+    ./prove.sh $PROVE_FLAG --journal "$journal" "$P" --out "$PR" >&3 2>&4
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
     { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start,$end)"
