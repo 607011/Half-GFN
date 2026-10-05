@@ -34,6 +34,8 @@
 #   --ecpp         prove with ECPP instead of APR-CL
 #   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
 #   -y | --yes     recompute/overwrite already-computed blocks without asking
+#   --gpu          run the PRP stage on the GPU NTT engine (ntt_metal, Fermat PRP);
+#                  sound (drops no primes) and worthwhile only for large k
 #   -h | --help
 #
 # If the requested range contains blocks that are already computed (present in
@@ -51,7 +53,7 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 BLOCK=1000000
 K=""; BMIN=""; BMAX=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
 BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
-VERBOSE=0; VFLAG=""; ASSUME_YES=0
+VERBOSE=0; VFLAG=""; ASSUME_YES=0; GPU=0
 
 usage() { awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
 
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
         -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
+        --gpu)    GPU=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "Unknown option: $1" >&2; usage 2 ;;
     esac
@@ -193,6 +196,16 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     if [ "$OVERWRITE" -eq 0 ] && [ -f "$prp_file" ] && has_stage prp; then
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
         echo "k=$K block [$start..$end]: reusing banked PRP survivors ($nprp)"
+    elif [ "$GPU" -eq 1 ]; then
+        # GPU path: NTT-accelerated Fermat PRP (ntt_metal). Sound as a pre-proof
+        # filter -- it drops no primes; a few extra Fermat pseudoprimes just reach
+        # the (authoritative) proof. Worthwhile only for large k.
+        [ -x ./build/ntt_metal ] || { echo "ERROR: --gpu needs ./build/ntt_metal (build it first)." >&2; exit 1; }
+        ./build/ntt_metal --prp "$cand_file" --out "$prp_file.tmp" --bases "$BASES" \
+            --journal "$prp_file.journal" $VFLAG >&3 2>&4
+        mv -f "$prp_file.tmp" "$prp_file"
+        nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
+        ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV,gpu-fermat" "$nprp" >/dev/null
     else
         ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" >&3 2>&4
         mv -f "$prp_file.tmp" "$prp_file"

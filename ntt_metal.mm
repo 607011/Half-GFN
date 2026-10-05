@@ -28,6 +28,10 @@
 #include <vector>
 #include <random>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <set>
+#include <algorithm>
 
 using u32 = uint32_t;
 using u64 = uint64_t;
@@ -640,12 +644,15 @@ struct Engine {
     CrtPlan crt;                    // precomputed Garner constants (primes fixed)
     double t_gpu = 0, t_cpu = 0;    // profiling accumulators (GPU work vs CPU post)
 
-    bool init(int k_, u64 b_) {
-        k = k_; N = (u64)1 << k_; b = b_; ln = (u32)k_; nn = (u32)N;
-        if ((b & 1) == 0 || b < 3) { fprintf(stderr, "need odd b >= 3\n"); return false; }
-        primes = ntt_primes_bound(N, b);
-        if (primes.empty()) { fprintf(stderr, "no NTT primes for k=%d b=%llu\n",
-                                      k, (unsigned long long)b); return false; }
+    id<MTLBuffer> mkbuf(const void* src, size_t bytes) {
+        return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
+                   : [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    }
+
+    // Build the b-independent GPU context once: device, compiled kernels, and the
+    // N-sized scratch buffers. Reused across many candidates (b) at a fixed k.
+    bool init_context(int k_) {
+        k = k_; N = (u64)1 << k_; ln = (u32)k_; nn = (u32)N;
         dev = MTLCreateSystemDefaultDevice();
         if (!dev) { fprintf(stderr, "no Metal device\n"); return false; }
         NSError* err = nil;
@@ -662,11 +669,23 @@ struct Engine {
         psST = pso_for("k_stage");       psSQ = pso_for("k_sq");
         psMUL = pso_for("k_mul");        psFIN = pso_for("k_final");
         q = [dev newCommandQueue];
+        bInX = mkbuf(nullptr, N * 4); bInY = mkbuf(nullptr, N * 4);
+        bW = mkbuf(nullptr, N * 4);
+        bFx = mkbuf(nullptr, N * 4); bFy = mkbuf(nullptr, N * 4);
+        bT = mkbuf(nullptr, N * 4);
+        return true;
+    }
 
-        auto mkbuf = [&](const void* src, size_t bytes) {
-            return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
-                       : [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        };
+    // (Re)build the b-dependent tables: NTT primes for this digit base b, the
+    // per-prime twiddle/weight tables, and the CRT plan. Releases the previous
+    // base's per-prime buffers (ARC) via G.clear().
+    bool set_base(u64 b_) {
+        b = b_;
+        if ((b & 1) == 0 || b < 3) { fprintf(stderr, "need odd b >= 3\n"); return false; }
+        primes = ntt_primes_bound(N, b);
+        if (primes.empty()) { fprintf(stderr, "no NTT primes for k=%d b=%llu\n",
+                                      k, (unsigned long long)b); return false; }
+        G.clear();
         for (u32 p : primes) {
             PrimeGPU g; g.p = p; g.n0 = mont_n0(p); g.r2 = mont_r2(p);
             u32 psi = find_psi(p, N);
@@ -685,13 +704,11 @@ struct Engine {
             g.bWIJ = mkbuf(WIJ.data(), N * 4);
             G.push_back(g);
         }
-        bInX = mkbuf(nullptr, N * 4); bInY = mkbuf(nullptr, N * 4);
-        bW = mkbuf(nullptr, N * 4);
-        bFx = mkbuf(nullptr, N * 4); bFy = mkbuf(nullptr, N * 4);
-        bT = mkbuf(nullptr, N * 4);
         crt = make_crt_plan(primes);
         return true;
     }
+
+    bool init(int k_, u64 b_) { return init_context(k_) && set_base(b_); }
 
     // One negacyclic multiply (squaring when squaring==true) of signed base-b
     // digit vectors mod (b^N+1); returns balanced base-b digits.
@@ -998,17 +1015,144 @@ static int selftest_bench(int k, u64 b, int iters) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Stage 6: production PRP. Compute a^(M-1) mod M on the GPU and return whether it
+// equals 1 (Fermat PRP to base a), with the stage-4b checkpoint/resume on the
+// powering. No GMP cross-check -- this is the real run, not a self-test.
+// ---------------------------------------------------------------------------
+static bool gpu_fermat_prp(Engine& eng, int k, u64 b, unsigned long a,
+                           u64 check_interval, bool no_ckpt) {
+    const u64 N = eng.N;
+    mpz_t BN1, M, E, a_red, got;
+    mpz_inits(BN1, M, E, a_red, got, nullptr);
+    mpz_ui_pow_ui(BN1, (unsigned long)b, (unsigned long)N); mpz_add_ui(BN1, BN1, 1);
+    mpz_fdiv_q_ui(M, BN1, 2);              // M = (b^N+1)/2
+    mpz_sub_ui(E, M, 1);                   // E = M-1
+    { mpz_t am; mpz_init_set_ui(am, a); mpz_mod(a_red, am, BN1); mpz_clear(am); }
+
+    std::vector<i64> acc = mpz_to_digits(a_red, N, b);
+    std::vector<i64> res(N, 0); res[0] = 1;
+    size_t bits = mpz_sizeinbase(E, 2);
+
+    std::string ckpt;
+    if (!no_ckpt) {
+        ckpt = "prp.k" + std::to_string(k) + ".b" + std::to_string(b) +
+               ".a" + std::to_string(a) + ".ckpt";
+    }
+    u64 next_bit = bits;
+    if (!ckpt.empty() && load_prp_ckpt(ckpt, k, b, a, next_bit, res)) {
+        fprintf(stderr, "  [resume b=%llu a=%lu at bit %llu/%zu]\n",
+                (unsigned long long)b, a, (unsigned long long)next_bit, bits);
+    }
+    for (size_t i = next_bit; i-- > 0;) {
+        res = eng.negamul(res, res, true);
+        if (mpz_tstbit(E, (mp_bitcnt_t)i)) res = eng.negamul(res, acc, false);
+        if (!ckpt.empty() && check_interval > 0 && (i % check_interval) == 0) {
+            save_prp_ckpt(ckpt, k, b, a, (u64)i, res);
+        }
+    }
+    if (!ckpt.empty()) { remove(ckpt.c_str()); }
+    digits_to_mpz(got, res, b); mpz_mod(got, got, M);   // reduce to M at the end
+    bool is_one = (mpz_cmp_ui(got, 1) == 0);
+    mpz_clears(BN1, M, E, a_red, got, nullptr);
+    return is_one;
+}
+
+// Production PRP over a candidate file (sieve output): Fermat PRP to all bases
+// (early-out on the first failing base), GPU-accelerated, output the survivors in
+// the same format prp_test uses. A journal records each tested base for resume.
+static int run_prp_file(const std::string& candfile, const std::string& out,
+                        std::vector<unsigned long> bases, long exp_override,
+                        const std::string& journal, bool no_ckpt, u64 check_interval,
+                        bool verbose) {
+    std::ifstream in(candfile);
+    if (!in) { fprintf(stderr, "Cannot open %s\n", candfile.c_str()); return 1; }
+    unsigned long expN = (exp_override > 0) ? (unsigned long)exp_override : 0;
+    std::vector<u64> cands;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == '#') {
+            if (expN == 0) { size_t c = line.find('^');
+                if (c != std::string::npos) expN = strtoul(line.c_str() + c + 1, nullptr, 10); }
+            continue;
+        }
+        if (line.empty()) continue;
+        u64 v = strtoull(line.c_str(), nullptr, 10);
+        if (v > 0) cands.push_back(v);
+    }
+    in.close();
+    if (expN == 0) { fprintf(stderr, "Exponent not readable -- pass --exp N.\n"); return 1; }
+    int k = 0; while (((u64)1 << k) < expN) ++k;
+    if (((u64)1 << k) != expN) { fprintf(stderr, "Exponent %lu is not a power of two.\n", expN); return 1; }
+    if (bases.empty()) bases = {2,3,5,7,11,13,17,19,23,29,31,37,41};
+
+    // Journal (resume): bases already fully tested -> their verdict is reused.
+    std::set<u64> done; std::vector<u64> prp_from_journal;
+    if (!journal.empty()) {
+        std::ifstream jin(journal);
+        u64 jb; int jv;
+        while (jin >> jb >> jv) { done.insert(jb); if (jv) prp_from_journal.push_back(jb); }
+    }
+    FILE* jf = journal.empty() ? nullptr : fopen(journal.c_str(), "a");
+
+    std::string basestr;
+    for (size_t i = 0; i < bases.size(); ++i) basestr += (i ? " " : "") + std::to_string(bases[i]);
+
+    // Build the GPU context (device, kernels, scratch) once; only the per-base
+    // tables are rebuilt per candidate.
+    Engine eng;
+    if (!eng.init_context(k)) return 2;
+
+    size_t tested = 0;
+    std::vector<u64> survivors = prp_from_journal;
+    auto t0 = std::chrono::steady_clock::now();
+    for (u64 b : cands) {
+        if (done.count(b)) continue;   // already tested (its verdict is in survivors)
+        if (!eng.set_base(b)) return 2;
+        bool prp = true;
+        for (unsigned long a : bases) {
+            if (!gpu_fermat_prp(eng, k, b, a, check_interval, no_ckpt)) { prp = false; break; }
+        }
+        ++tested;
+        if (prp) survivors.push_back(b);
+        if (jf) { fprintf(jf, "%llu %d\n", (unsigned long long)b, prp ? 1 : 0); fflush(jf); }
+        if (verbose) {
+            fprintf(stderr, "  (%llu^%lu+1)/2  %s\n",
+                    (unsigned long long)b, expN, prp ? "PRP" : "composite");
+        }
+    }
+    if (jf) fclose(jf);
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    std::sort(survivors.begin(), survivors.end());
+    survivors.erase(std::unique(survivors.begin(), survivors.end()), survivors.end());
+    std::ofstream of(out);
+    of << "# PRP bases for (b^" << expN << "+1)/2, base(s) " << basestr << " [GPU/NTT Fermat]\n";
+    for (u64 b : survivors) of << b << "\n";
+    of.close();
+    if (!journal.empty()) remove(journal.c_str());   // completed -> obsolete
+
+    printf("GPU PRP (k=%d, %zu bases): tested %zu candidates in %.1f s -> %zu PRP -> %s\n",
+           k, bases.size(), tested, secs, survivors.size(), out.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int k = 16;
     u64 b = 10001;
     int reps = 8;
     unsigned long base_a = 3;
     std::string mode, ckpt_path;
-    bool no_ckpt = false;
+    bool no_ckpt = false, verbose = false;
     u64 check_interval = 1000;    // checkpoint every N processed bits (prp mode)
-    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp|bench} [--k K] [--b B]\n"
-                        "          [--base A] [--reps R] [--checkpoint FILE | --no-checkpoint]\n"
-                        "          [--check-interval N]\n";
+    // Production PRP mode:
+    std::string prp_file, out = "prp.txt", journal, bases_str;
+    long exp_override = -1;
+    const char* usage =
+        "Usage (self-test):  %s --selftest {montmul|ntt|negamul|prp|bench} [--k K] [--b B]\n"
+        "                      [--base A] [--reps R] [--checkpoint FILE|--no-checkpoint] [--check-interval N]\n"
+        "Usage (production): %s --prp CANDFILE [--out prp.txt] [--bases \"2 3 5 ...\"] [--exp N]\n"
+        "                      [--journal FILE] [--no-checkpoint] [--check-interval N] [-v]\n";
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) {
@@ -1016,6 +1160,12 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if      (s == "--selftest") mode = nx("--selftest");
+        else if (s == "--prp")      prp_file = nx("--prp");
+        else if (s == "--out")      out = nx("--out");
+        else if (s == "--bases")    bases_str = nx("--bases");
+        else if (s == "--journal")  journal = nx("--journal");
+        else if (s == "--exp")      exp_override = atol(nx("--exp"));
+        else if (s == "-v" || s == "--verbose") verbose = true;
         else if (s == "--k")        k = atoi(nx("--k"));
         else if (s == "--b")        b = strtoull(nx("--b"), nullptr, 10);
         else if (s == "--base")     base_a = strtoul(nx("--base"), nullptr, 10);
@@ -1023,13 +1173,19 @@ int main(int argc, char** argv) {
         else if (s == "--checkpoint")     ckpt_path = nx("--checkpoint");
         else if (s == "--no-checkpoint")  no_ckpt = true;
         else if (s == "--check-interval") check_interval = strtoull(nx("--check-interval"), nullptr, 10);
-        else { fprintf(stderr, usage, argv[0]); return 2; }
+        else { fprintf(stderr, usage, argv[0], argv[0]); return 2; }
+    }
+    if (!prp_file.empty()) {
+        std::vector<unsigned long> bases;
+        std::istringstream is(bases_str); unsigned long v;
+        while (is >> v) bases.push_back(v);
+        return run_prp_file(prp_file, out, bases, exp_override, journal, no_ckpt, check_interval, verbose);
     }
     if (mode == "montmul")  return selftest_montmul(k);
     if (mode == "ntt")      return selftest_ntt(k);
     if (mode == "negamul")  return selftest_negamul(k, b, reps);
     if (mode == "prp")      return selftest_prp(k, b, base_a, ckpt_path, no_ckpt, check_interval);
     if (mode == "bench")    return selftest_bench(k, b, reps);
-    fprintf(stderr, usage, argv[0]);
+    fprintf(stderr, usage, argv[0], argv[0]);
     return 2;
 }

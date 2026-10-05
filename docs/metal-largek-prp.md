@@ -211,9 +211,18 @@ behind a `--selftest` mode).
    The optimisation that got there was all CPU-side post-processing (see §2.1
    finding). Remaining perf work (**5b**): four-step tiling (§4) + batching the
    primes into one command buffer to cut the GPU half and push the crossover lower.
-6. **Integrate** behind the same CLI / journal contract as `prp_test`, so the
-   sieve → PRP → prove pipeline is unchanged. Route small k to CPU/`prp_metal`,
-   large k to this engine.
+6. **Integrate — DONE.** `ntt_metal --prp CANDFILE --out F [--bases ...] [--journal F]`
+   is a production mode: it reads a sieve candidate file, runs a GPU **Fermat** PRP
+   (`a^(M−1) mod M == 1`) to all bases with early-out, writes the survivors in
+   `prp_test`'s format, and journals per candidate for resume. The GPU context
+   (device, kernels, scratch) is built once and only the per-base tables are rebuilt
+   per candidate. `run_blocks.sh --gpu` routes the PRP stage here instead of
+   `prp_test`. Soundness: Fermat PRP drops no primes (every prime passes), so it is a
+   valid pre-proof filter — a few extra Fermat pseudoprimes just reach the
+   authoritative proof. Gate met: on k=6 [0..99] the GPU path yields the **same
+   proven primes** as the CPU path (3, 35, 51, 85), and on k=5 the GPU Fermat
+   survivors are a superset of the CPU strong-MR survivors (no prime lost).
+   Worthwhile only for large k (small k stays on `prp_test`, which is faster there).
 
 ---
 
