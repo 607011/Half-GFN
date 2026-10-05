@@ -18,15 +18,17 @@
 #   -y forces a fresh recomputation (overwrites banked files).
 #
 # Usage:
-#   ./run_blocks.sh --k K --from START --to END [options]
+#   ./run_blocks.sh --k K --bmin B --bmax C [options]
+#   Tests the odd bases b with B <= b <= C (INCLUSIVE; b >= 3) end to end.
 # Options:
-#   --block SIZE   tiling granularity: SIZE bases per block (default 1000000). It
-#                  does NOT set the range -- that is --from/--to. SIZE only chops a
-#                  large range into per-block units (the unit of coverage records,
-#                  of block-level resume, and of a distributed 'claim'). Shrink it
-#                  for large k, where even one 1e6 block would take far too long.
-#                  For a single small range you can ignore it: the last block is
-#                  clamped to --to, so e.g. '--from 0 --to 100' yields one [0,100).
+#   --block SIZE   tiling granularity: SIZE integers per block (default 1000000).
+#                  It does NOT set the range -- that is --bmin/--bmax. SIZE only
+#                  chops the range into per-block units (the unit of coverage rows,
+#                  of block-level resume, and of a distributed 'claim'). The
+#                  interval size (bmax-bmin+1) MUST be a whole multiple of SIZE.
+#                  Shrink SIZE for large k, where even one 1e6 block would take far
+#                  too long; for a small range, set SIZE to the range size (= one
+#                  block), e.g. --bmin 0 --bmax 999 --block 1000.
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
 #   --bases "..."  PRP bases (default: first 13 primes, "2 3 5 ... 41")
 #   --ecpp         prove with ECPP instead of APR-CL
@@ -39,15 +41,15 @@
 # overwrite. Answering no (or a non-interactive run without -y) keeps the existing
 # results and computes only the missing blocks. -y recomputes and overwrites all.
 #
-# Processes [START, END) in steps of --block; the final block is clamped to END,
-# so END is a true upper bound. For resumable multi-block sweeps, keep START and
-# SIZE aligned (START a multiple of SIZE) so blocks tile consistently across runs.
+# The interval [bmin,bmax] is inclusive and must be a whole number of blocks. Each
+# block covers the inclusive sub-range [block_bmin, block_bmax]. For resumable
+# multi-block sweeps across runs, keep bmin aligned to SIZE so blocks tile the same.
 #
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 BLOCK=1000000
-K=""; FROM=""; TO=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
+K=""; BMIN=""; BMAX=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
 BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
 VERBOSE=0; VFLAG=""; ASSUME_YES=0
 
@@ -56,8 +58,8 @@ usage() { awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$
 while [ $# -gt 0 ]; do
     case "$1" in
         --k)      K="$2"; shift 2 ;;
-        --from)   FROM="$2"; shift 2 ;;
-        --to)     TO="$2"; shift 2 ;;
+        --bmin)   BMIN="$2"; shift 2 ;;
+        --bmax)   BMAX="$2"; shift 2 ;;
         --block)  BLOCK="$2"; shift 2 ;;
         --plimit) PLIMIT="$2"; shift 2 ;;
         --bases)  BASES="$2"; shift 2 ;;
@@ -68,7 +70,17 @@ while [ $# -gt 0 ]; do
         *) echo "Unknown option: $1" >&2; usage 2 ;;
     esac
 done
-[ -n "$K" ] && [ -n "$FROM" ] && [ -n "$TO" ] || { echo "Error: --k, --from, --to required." >&2; usage 2; }
+[ -n "$K" ] && [ -n "$BMIN" ] && [ -n "$BMAX" ] || { echo "Error: --k, --bmin, --bmax required." >&2; usage 2; }
+[ "$BMAX" -ge "$BMIN" ] || { echo "Error: --bmax ($BMAX) must be >= --bmin ($BMIN)." >&2; exit 2; }
+# The interval [bmin,bmax] (inclusive) must be a whole number of blocks.
+len=$(( BMAX - BMIN + 1 ))
+if [ $(( len % BLOCK )) -ne 0 ]; then
+    nblk=$(( (len + BLOCK - 1) / BLOCK ))
+    suggest=$(( BMIN + nblk * BLOCK - 1 ))
+    echo "Error: the interval [$BMIN,$BMAX] spans $len bases, not a multiple of --block ($BLOCK)." >&2
+    echo "Use a multiple, e.g. --bmax $suggest, or a --block that divides $len." >&2
+    exit 2
+fi
 
 # Diagnostic output of the called tools goes to fd 3/4: the terminal when -v is
 # set, otherwise /dev/null. The result files (--out) are unaffected either way.
@@ -80,16 +92,16 @@ mkdir -p .proofwork "results/primes/k$K" "results/candidates/k$K" "results/prp/k
 [ -f results/primes.tsv ] || \
     printf '# date\tk\tblock_start\tblock_end\tn_primes\tmax_digits\tmethod\tcommit\thost\n' > results/primes.tsv
 
-# --- Pre-scan: which blocks in [FROM,TO) already have results in coverage.tsv? ---
-# Matched on the exact (k, block_start, block_end), so a different block size with
+# --- Pre-scan: which blocks in [BMIN,BMAX] already have results in coverage.tsv? ---
+# Matched on the exact (k, block_bmin, block_bmax), so a different block size with
 # the same start does NOT count as this block. A block is "done" once its proof is
 # recorded; "partial" means sieve and/or PRP are recorded but the proof is not.
 # OVERWRITE=1 means recompute done blocks (overwrite); 0 means skip them (resume).
 OVERWRITE=0
 done_blocks=()
 partial_blocks=()
-for (( s=FROM; s<TO; s+=BLOCK )); do
-    e=$(( s + BLOCK < TO ? s + BLOCK : TO ))   # clamp the last block to --to
+for (( s=BMIN; s<=BMAX; s+=BLOCK )); do
+    e=$(( s + BLOCK - 1 < BMAX ? s + BLOCK - 1 : BMAX ))   # inclusive block upper
     stages=$(awk -F'\t' -v k="$K" -v st="$s" -v en="$e" \
         '$2==k && $3==st && $4==en { seen[$5]=1 } END { for (x in seen) printf "%s ", x }' \
         coverage.tsv 2>/dev/null)
@@ -102,11 +114,12 @@ done
 # (a) Report blocks with partial results (sieve/PRP present, proof pending). They
 # are recomputed either way (no proof yet) -- this is informational only.
 if [ "${#partial_blocks[@]}" -gt 0 ]; then
-    echo "note: ${#partial_blocks[@]} block(s) in [$FROM,$TO) have partial results" \
+    echo "note: ${#partial_blocks[@]} block(s) in [$BMIN,$BMAX] have partial results" \
          "(sieve/PRP recorded, proof pending) and will be (re)computed:"
     show=6; [ "${#partial_blocks[@]}" -lt "$show" ] && show="${#partial_blocks[@]}"
     for (( i=0; i<show; i++ )); do
-        ps="${partial_blocks[$i]}"; echo "  k=$K block [$ps,$((ps+BLOCK)))"
+        ps="${partial_blocks[$i]}"; pe=$(( ps + BLOCK - 1 < BMAX ? ps + BLOCK - 1 : BMAX ))
+        echo "  k=$K block [$ps..$pe]"
     done
     [ "${#partial_blocks[@]}" -gt "$show" ] && echo "  ... and $(( ${#partial_blocks[@]} - show )) more"
 fi
@@ -115,7 +128,7 @@ if [ "${#done_blocks[@]}" -gt 0 ]; then
     first="${done_blocks[0]}"; last="${done_blocks[${#done_blocks[@]}-1]}"
     if [ "$ASSUME_YES" -eq 1 ]; then
         OVERWRITE=1
-        echo "note: ${#done_blocks[@]} block(s) in [$FROM,$TO) already computed -> recomputing and overwriting (-y)."
+        echo "note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> recomputing and overwriting (-y)."
     elif [ -t 0 ]; then
         echo "k=$K: ${#done_blocks[@]} of the requested blocks are already computed" \
              "(first start=$first, last start=$last)."
@@ -126,7 +139,7 @@ if [ "${#done_blocks[@]}" -gt 0 ]; then
             *) OVERWRITE=0; echo "Keeping existing results; computing only the missing blocks." ;;
         esac
     else
-        echo "note: ${#done_blocks[@]} block(s) in [$FROM,$TO) already computed -> skipping them." \
+        echo "note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> skipping them." \
              "Use -y to recompute and overwrite." >&2
     fi
 fi
@@ -139,14 +152,14 @@ has_stage() {  # $1 = sieve|prp ; uses $K,$start,$end
         '$2==k && $3==s && $4==e && $5==st { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null
 }
 
-for (( start=FROM; start<TO; start+=BLOCK )); do
-    end=$(( start + BLOCK < TO ? start + BLOCK : TO ))   # clamp the last block to --to
-    bmin=$(( start + 1 )); [ "$start" -eq 0 ] && bmin=3
+for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
+    end=$(( start + BLOCK - 1 < BMAX ? start + BLOCK - 1 : BMAX ))   # inclusive block upper
+    bmin=$start; [ "$bmin" -lt 3 ] && bmin=3   # the smallest valid base is 3
 
     # --- block level: already proved? -> skip, unless the user chose to overwrite ---
     if [ "$OVERWRITE" -eq 0 ] && awk -F'\t' -v k="$K" -v s="$start" -v e="$end" \
         '$2==k && $3==s && $4==e && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
-        echo "k=$K block [$start,$end): already proved -> skipped"
+        echo "k=$K block [$start..$end]: already proved -> skipped"
         continue
     fi
 
@@ -160,7 +173,7 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     # --- Stage 1: sieve (reuse banked candidates if present) ---
     if [ "$OVERWRITE" -eq 0 ] && [ -f "$cand_file" ] && has_stage sieve; then
         nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
-        echo "k=$K block [$start,$end): reusing banked candidates ($nsieve)"
+        echo "k=$K block [$start..$end]: reusing banked candidates ($nsieve)"
     else
         # safety guard: the sieve is correct only if M(bmin) > plimit
         if ! awk -v n="$N" -v b="$bmin" -v p="$PLIMIT" \
@@ -179,7 +192,7 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     # --- Stage 2: PRP (reuse banked survivors if present) ---
     if [ "$OVERWRITE" -eq 0 ] && [ -f "$prp_file" ] && has_stage prp; then
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
-        echo "k=$K block [$start,$end): reusing banked PRP survivors ($nprp)"
+        echo "k=$K block [$start..$end]: reusing banked PRP survivors ($nprp)"
     else
         ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" >&3 2>&4
         mv -f "$prp_file.tmp" "$prp_file"
@@ -192,7 +205,7 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     ./prove.sh $PROVE_FLAG --journal "$journal" "$prp_file" --out "$PR" >&3 2>&4
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
-    { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start,$end)"
+    { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start..$end]"
       grep '^[0-9]' "$PR" || true; } > "results/primes/k$K/${start}-${end}.txt"
 
     ./coverage.sh record "$K" "$start" "$end" proof "method=$METHOD" "$nprimes" >/dev/null
@@ -212,5 +225,5 @@ for (( start=FROM; start<TO; start+=BLOCK )); do
     # intra-block journal. Keep the banked candidates (reproducible, gitignored,
     # reusable for a re-PRP with other bases).
     rm -f "$PR" "$prp_file" "$journal"
-    echo "k=$K block [$start,$end): sieve=$nsieve prp=$nprp primes=$nprimes (max $dig digits)"
+    echo "k=$K block [$start..$end]: sieve=$nsieve prp=$nprp primes=$nprimes (max $dig digits)"
 done

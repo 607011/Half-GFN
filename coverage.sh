@@ -8,9 +8,9 @@
 # exactly one new line at the end).
 #
 # Block sizes may VARY (e.g. orders of magnitude smaller for large k, where even
-# one base is expensive). A block covers the odd bases in [block_start, block_end);
-# both bounds are stored explicitly, so no fixed size is baked in. Within one k,
-# tile consistently from 0 at whatever size you choose for that k.
+# one base is expensive). A block covers the odd bases in [block_start, block_end]
+# (inclusive); both bounds are stored explicitly, so no fixed size is baked in.
+# Within one k, tile consistently at whatever size you choose for that k.
 #
 # Stages: sieve  (params: plimit=...)
 #         prp    (params: bases=3,5,7)
@@ -18,7 +18,7 @@
 #
 # Usage:
 #   ./coverage.sh record K BLOCK_START BLOCK_END STAGE PARAMS COUNT
-#        e.g.  ./coverage.sh record 15 0 1000000 sieve plimit=1e9 80375
+#        e.g.  ./coverage.sh record 15 0 999999 sieve plimit=1e9 80375   (block [0..999999])
 #   ./coverage.sh status      # generate STATUS.md from coverage.tsv
 #   ./coverage.sh todo        # blocks with PRP done but proof pending
 #   ./coverage.sh claim   K BLOCK_START BLOCK_END STAGE [TTL_HOURS]  # reserve a block
@@ -77,8 +77,8 @@ cmd_record() {
         sieve|prp|proof) ;;
         *) echo "Unknown stage: $STAGE (sieve|prp|proof)" >&2; exit 2 ;;
     esac
-    if [ "$BE" -le "$BS" ]; then
-        echo "Warning: block_end $BE <= block_start $BS." >&2
+    if [ "$BE" -lt "$BS" ]; then
+        echo "Warning: block_end $BE < block_start $BS." >&2
     fi
     local date commit host
     date=$(date -u +%Y-%m-%d)
