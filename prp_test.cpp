@@ -30,11 +30,11 @@
 //   ./prp_test [options] [candidate-file]        (default: kand.txt)
 // Options:
 //   --exp N        override the exponent (otherwise from the header)
-//   --bases "a b"  PRP bases, space-separated (default "3")
+//   --bases "a b"  PRP bases, space-separated (default: first 13 primes, 2..41)
 //   --limit N      test only the first N candidates (0 = all)
 //   --out FILE     write the PRP bases here (default prp.txt)
 //   --threads N    threads (default: all cores)
-//   --verbose      also report composite candidates
+//   -v, --verbose  also report composite candidates
 
 #include <gmp.h>
 
@@ -131,6 +131,7 @@ static bool test_candidate(unsigned long b, unsigned long exp,
 int main(int argc, char** argv) {
     std::string candfile, out = "prp.txt";
     std::string journal_path;
+    bool no_journal = false;
     long exp_override = -1;
     long limit = 0;
     int nthreads = (int)std::thread::hardware_concurrency();
@@ -163,17 +164,23 @@ int main(int argc, char** argv) {
             out = next("--out");
         } else if (a == "--threads") {
             nthreads = atoi(next("--threads").c_str());
-        } else if (a == "--verbose") {
+        } else if (a == "--verbose" || a == "-v") {
             verbose = true;
         } else if (a == "--journal") {
             journal_path = next("--journal");
+        } else if (a == "--no-journal") {
+            no_journal = true;
         } else if (a == "-h" || a == "--help") {
-            printf("Usage: %s [--exp N] [--bases \"3 5 7\"] [--limit N] "
-                   "[--out prp.txt] [--threads N] [--verbose]\n"
-                   "       [--journal FILE] [candidate-file]\n"
-                   "  --journal: every tested base is logged immediately; running\n"
-                   "             again with the same journal skips those bases\n"
-                   "             (resume). Ctrl-C exits cleanly.\n", argv[0]);
+            printf("Usage: %s [--exp N] [--bases \"2 3 5 ...\"] [--limit N] "
+                   "[--out prp.txt] [--threads N] [-v|--verbose]\n"
+                   "       [--journal FILE | --no-journal] [candidate-file]\n"
+                   "  --bases: default is the first 13 primes (2 3 5 ... 41).\n"
+                   "  -v:      also report composite candidates.\n"
+                   "  --journal: ON by default -- without it, '<candidate-file>.journal'\n"
+                   "             is used. Every tested base is logged immediately; running\n"
+                   "             again with the same journal skips those bases (resume) and\n"
+                   "             the journal is removed once the run completes. Ctrl-C exits\n"
+                   "             cleanly, keeping the journal. --no-journal disables it.\n", argv[0]);
             return 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", a.c_str());
@@ -185,8 +192,22 @@ int main(int argc, char** argv) {
     if (candfile.empty()) {
         candfile = "kand.txt";
     }
+    // Journaling is on by default: without --journal, use "<candfile>.journal" so
+    // a resume is tied to this candidate set. --no-journal opts out.
+    if (no_journal) {
+        journal_path.clear();
+    } else if (journal_path.empty()) {
+        journal_path = candfile + ".journal";
+    }
     if (bases.empty()) {
-        bases = {3};
+        // Default: the first 13 primes as strong-PRP bases. Composites almost
+        // always fail the first base (2), so the extra bases cost next to nothing
+        // (early-out) yet make a false "probable prime" vanishingly unlikely before
+        // the proof stage -- and are the strongest practical claim at large k where
+        // a full proof is infeasible. NB: these are *not* a deterministic witness
+        // set at these sizes (that only holds for n < 3.3e24); they are 13
+        // probabilistic rounds.
+        bases = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
     }
     if (nthreads < 1) {
         nthreads = 1;
@@ -392,5 +413,10 @@ int main(int argc, char** argv) {
     printf("--------------------------------------------------------------------------\n");
     printf("Done in %.1f s. %zu bases tested in this run, %zu PRP total -> %s\n",
            secs, done.load(), prp_bases.size(), out.c_str());
+
+    // Completed successfully -> the journal is obsolete; remove it.
+    if (journaling && !journal_path.empty()) {
+        std::remove(journal_path.c_str());
+    }
     return 0;
 }

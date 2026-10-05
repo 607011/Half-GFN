@@ -27,9 +27,11 @@
 #   --ecpp         ECPP instead of APR-CL (isprime(.,2); yields a certificate,
 #                  often faster for very large numbers)
 #   --stack BYTES  PARI stack size (default 2000000000 = ~2 GB)
-#   --journal FILE every proved/tested base is logged immediately; running again
-#                  with the same journal skips it (resume). Ctrl-C exits cleanly
-#                  and the journal is kept.
+#   --journal FILE journaling is ON by default (file "<infile>.journal"); every
+#                  proved/tested base is logged immediately and skipped on a rerun
+#                  (resume). The journal is removed once all candidates are proved;
+#                  Ctrl-C exits cleanly and keeps it.
+#   --no-journal   do not read or write a resume journal
 #   -h | --help
 #
 set -euo pipefail
@@ -41,6 +43,7 @@ OUT="primes.txt"
 FLAG=0                    # 0 = isprime default (APR-CL), 2 = ECPP
 STACK=2000000000
 JOURNAL=""
+NO_JOURNAL=0
 INTERRUPTED=0
 
 usage() { awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
@@ -53,12 +56,21 @@ while [ $# -gt 0 ]; do
         --ecpp)   FLAG=2; shift ;;
         --stack)  STACK="$2"; shift 2 ;;
         --journal) JOURNAL="$2"; shift 2 ;;
+        --no-journal) NO_JOURNAL=1; shift ;;
         -h|--help) usage 0 ;;
         -*)       echo "Unknown option: $1" >&2; usage 2 ;;
         *)        INFILE="$1"; shift ;;
     esac
 done
 [ -z "$INFILE" ] && INFILE="prp.txt"
+
+# Journaling is on by default: without --journal, use "<infile>.journal" so a
+# resume is tied to this input. --no-journal opts out.
+if [ "$NO_JOURNAL" -eq 1 ]; then
+    JOURNAL=""
+elif [ -z "$JOURNAL" ]; then
+    JOURNAL="${INFILE}.journal"
+fi
 
 command -v gp >/dev/null 2>&1 || {
     echo "PARI/GP (gp) not found. Install:  brew install pari" >&2; exit 127; }
@@ -83,6 +95,7 @@ NALL=$(wc -l < "$ALL" | tr -d ' ')
 # with 0 PRP survivors is a legitimate result, common for small blocks at large k.)
 if [ "$NALL" -eq 0 ]; then
     : > "$OUT"
+    [ -n "$JOURNAL" ] && rm -f "$JOURNAL"
     echo "No bases in $INFILE -- nothing to prove (0 proven)."
     exit 0
 fi
@@ -178,4 +191,6 @@ if [ "$INTERRUPTED" -eq 1 ] || [ "$rc" -ge 128 ]; then
 fi
 echo "Done. $nprime proven prime(s) -> $OUT"
 [ "$rc" -ne 0 ] && { echo "Note: gp exited with code $rc (see $LOG)." >&2; exit "$rc"; }
+# Completed cleanly -> the journal is obsolete; remove it.
+[ -n "$JOURNAL" ] && rm -f "$JOURNAL"
 exit 0

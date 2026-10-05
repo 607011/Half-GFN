@@ -48,14 +48,15 @@ picks another block. This is what makes double work impossible.
    ```
 3. Claim it, then publish the claim **before** computing:
    ```bash
-   ./coverage.sh claim 4 16000000 proof        # k=4, block [16e6, 17e6)
+   ./coverage.sh claim 4 16000000 16999999 proof   # k=4, block [16000000..16999999]
    git add claims.tsv && git commit -m "claim k4 b16 proof" && git push
    #   push rejected? -> git pull, pick another block, retry (nothing computed yet)
    ```
 4. Only after the push lands, compute. The easy path runs the whole pipeline and
-   records every stage for you:
+   records every stage for you (--bmin/--bmax are inclusive; the interval must be a
+   whole number of --block blocks):
    ```bash
-   ./run_blocks.sh --k 4 --from 16000000 --to 17000000
+   ./run_blocks.sh --k 4 --bmin 16000000 --bmax 16999999 --block 1000000
    ```
    (Or run the stages by hand: `hgfn_sieve` → `prp_test` → `prove.sh`.)
 5. Publish the results:

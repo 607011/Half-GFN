@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
     std::string candfile;
     long exp_override = -1;
     long limit = 0;
+    bool verbose = false;
     std::vector<unsigned long> bases;
 
     for (int i = 1; i < argc; ++i) {
@@ -261,8 +262,12 @@ int main(int argc, char** argv) {
             while (is >> v) { bases.push_back(v); }
         } else if (a == "--limit") {
             limit = atol(next("--limit").c_str());
+        } else if (a == "-v" || a == "--verbose") {
+            verbose = true;
         } else if (a == "-h" || a == "--help") {
-            printf("Usage: %s [--bases \"3 5 7\"] [--limit N] [--exp N] [candidate-file]\n", argv[0]);
+            printf("Usage: %s [--bases \"2 3 5 ...\"] [--limit N] [--exp N] [-v|--verbose] [candidate-file]\n"
+                   "  --bases: default is the first 13 primes (2 3 5 ... 41).\n"
+                   "  -v:      print the Metal device, kernel size and dispatch detail.\n", argv[0]);
             return 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", a.c_str());
@@ -272,7 +277,11 @@ int main(int argc, char** argv) {
         }
     }
     if (candfile.empty()) { candfile = "kand.txt"; }
-    if (bases.empty()) { bases = {3}; }
+    if (bases.empty()) {
+        // Default: first 13 primes (see prp_test.cpp for the rationale; composites
+        // fail base 2 first, so the extra bases are near-free via early-out).
+        bases = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
+    }
 
     // Read candidates (exponent from the header).
     std::ifstream in(candfile);
@@ -383,6 +392,16 @@ int main(int argc, char** argv) {
         id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
         if (!pso) { fprintf(stderr, "Pipeline: %s\n", err.localizedDescription.UTF8String); return 1; }
         id<MTLCommandQueue> q = [dev newCommandQueue];
+
+        if (verbose) {
+            fprintf(stderr,
+                    "[metal] device: %s\n"
+                    "[metal] kernel NL=%d limbs (%zu-bit M)  bases: %s\n"
+                    "[metal] setup threads: %d  maxThreadsPerThreadgroup: %lu\n",
+                    dev.name.UTF8String, NL, max_bits, basestr.c_str(),
+                    setup_threads, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+            fflush(stderr);
+        }
 
         auto mkbuf = [&](const void* p, size_t bytes) {
             return [dev newBufferWithBytes:p length:bytes options:MTLResourceStorageModeShared];

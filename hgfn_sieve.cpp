@@ -51,6 +51,10 @@ static void on_signal(int) {
     g_stop = 1;
 }
 
+// Verbose mode (-v): emit the live progress report and a startup banner to
+// stderr. Off by default so the sieve stays quiet in scripted runs.
+static bool g_verbose = false;
+
 // ---------------------------------------------------------------------------
 // Modular arithmetic
 // ---------------------------------------------------------------------------
@@ -343,6 +347,17 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
         strike_odd_powers(alive, b0, bmax);
     }
 
+    if (g_verbose) {
+        fprintf(stderr,
+                "[sieve] N=2^%d=%llu  step=2N=%llu  bases %lld..%lld (%zu odd)  "
+                "plimit=%llu  jmax=%llu  threads=%d  chunk=%llu\n",
+                k, (unsigned long long)N, (unsigned long long)step,
+                (long long)b0, (long long)bmax, count,
+                (unsigned long long)plimit, (unsigned long long)jmax, nthreads,
+                (unsigned long long)((u64)1 << 16));
+        fflush(stderr);
+    }
+
     auto t_start = std::chrono::steady_clock::now();
     auto t_last_report = t_start;
     auto t_last_ckpt = t_start;
@@ -415,7 +430,8 @@ static SieveResult sieve(int k, int64_t bmin, int64_t bmax, u64 plimit,
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - t_start).count();
 
-        if (std::chrono::duration<double>(now - t_last_report).count() >= report_every) {
+        if (g_verbose &&
+            std::chrono::duration<double>(now - t_last_report).count() >= report_every) {
             t_last_report = now;
             fprintf(stderr, "p up to %16llu  primes: %10llu  time: %6.0f s\n",
                     (unsigned long long)(step * (j - 1) + 1),
@@ -473,6 +489,7 @@ int main(int argc, char** argv) {
     double plimit_d = 1e8;
     std::string out = "candidates.txt";
     std::string ckpt_path;
+    bool no_checkpoint = false;
     double ckpt_interval = 60.0;
     std::string pause_file;
     int nthreads = (int)std::thread::hardware_concurrency();
@@ -503,18 +520,25 @@ int main(int argc, char** argv) {
             nthreads = atoi(next("--threads"));
         } else if (a == "--checkpoint") {
             ckpt_path = next("--checkpoint");
+        } else if (a == "--no-checkpoint") {
+            no_checkpoint = true;
         } else if (a == "--checkpoint-interval") {
             ckpt_interval = atof(next("--checkpoint-interval"));
         } else if (a == "--pause-file") {
             pause_file = next("--pause-file");
+        } else if (a == "-v" || a == "--verbose") {
+            g_verbose = true;
         } else if (a == "-h" || a == "--help") {
             printf("Usage: %s --k K --bmax BMAX [--bmin 3] [--plimit 1e8] "
-                   "[--out candidates.txt] [--threads N]\n"
-                   "       [--checkpoint FILE] [--checkpoint-interval SEC] [--pause-file FILE]\n"
-                   "  If the checkpoint file exists, the run resumes automatically.\n"
+                   "[--out candidates.txt] [--threads N] [-v|--verbose]\n"
+                   "       [--checkpoint FILE | --no-checkpoint] [--checkpoint-interval SEC] [--pause-file FILE]\n"
+                   "  Checkpointing is ON by default: without --checkpoint a default file\n"
+                   "  'sieve.k<k>.<bmin>-<bmax>.ckpt' is used; it resumes automatically if\n"
+                   "  present and is deleted once the sieve finishes. --no-checkpoint disables it.\n"
                    "  Ctrl-C writes a checkpoint at the next block boundary and exits.\n"
                    "  --pause-file: while the file exists, the sieve pauses at a block\n"
-                   "                boundary (remove it to resume).\n",
+                   "                boundary (remove it to resume).\n"
+                   "  -v:           print a startup banner and live progress to stderr.\n",
                    argv[0]);
             return 0;
         } else {
@@ -530,6 +554,16 @@ int main(int argc, char** argv) {
         nthreads = 1;
     }
     u64 plimit = (u64)plimit_d;
+
+    // Checkpointing is on by default. Without an explicit --checkpoint, use a
+    // name derived from (k, bmin, bmax) so it only ever matches the same sieve
+    // (load_checkpoint aborts on a parameter mismatch). --no-checkpoint opts out.
+    if (no_checkpoint) {
+        ckpt_path.clear();
+    } else if (ckpt_path.empty()) {
+        ckpt_path = "sieve.k" + std::to_string(k) + "." +
+                    std::to_string(bmin) + "-" + std::to_string(bmax) + ".ckpt";
+    }
 
     // Catch Ctrl-C / kill cleanly -> checkpoint at the next block boundary.
     std::signal(SIGINT, on_signal);
@@ -569,5 +603,10 @@ int main(int argc, char** argv) {
     }
     fclose(f);
     printf("Candidates written to %s\n", out.c_str());
+
+    // Sieve finished successfully -> the checkpoint is obsolete; remove it.
+    if (!ckpt_path.empty()) {
+        std::remove(ckpt_path.c_str());
+    }
     return 0;
 }

@@ -9,6 +9,7 @@ build-*/
 # Runtime artifacts
 *.ckpt
 *.done
+*.journal
 prove_work/
 pfgw_work/
 

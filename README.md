@@ -356,8 +356,10 @@ so a completed block is unambiguous and reproducible.
 ./coverage.sh todo     # blocks where PRP is done but the proof is still pending
 ```
 
-`run_blocks.sh` drives this for a whole range; `--block SIZE` sets the block size
-(default 1e6) — shrink it for large `k`.
+`run_blocks.sh --k K --bmin B --bmax C` drives this for a whole range: it tests the
+odd bases `B ≤ b ≤ C` (inclusive). `--block SIZE` sets the block size (default 1e6,
+the unit of a coverage row / resume / claim) — shrink it for large `k`. The interval
+size must be a whole multiple of `SIZE`.
 
 `STATUS.md` is generated from the ledger — never edit it by hand. Each completion is
 a single appended line, so two machines rarely produce a merge conflict; regenerate
@@ -372,12 +374,12 @@ Several machines coordinate through the git repo itself — no server. A short-l
 ```bash
 git pull
 ./coverage.sh todo                     # or status — find a free block
-./coverage.sh claim 8 0 proof          # reserve it (lease, default 7 days)
+./coverage.sh claim 8 0 999999 proof   # reserve block [0..999999] (lease, default 7 days)
 git add claims.tsv && git commit -m "claim k8 b0 proof" && git push
 #   push rejected?  ->  git pull, pick another block, retry (nothing computed yet)
 #   push accepted?  ->  ONLY NOW start computing
 ./prove.sh ...                         # the actual (hours/days) work
-./coverage.sh record 8 0 1000000 proof method=aprcl 123   # done = releases the block
+./coverage.sh record 8 0 999999 proof method=aprcl 123   # done = releases the block
 git add -A && git commit && git push
 ```
 
