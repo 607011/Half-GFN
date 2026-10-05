@@ -839,12 +839,56 @@ static int selftest_negamul(int k, u64 b, int reps) {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 4b: checkpoint / resume of the PRP powering. Persist the residue and the
+// loop position atomically (tmp + rename), so a multi-day large-k run survives a
+// crash, reboot or Ctrl-C and resumes from the last checkpoint. The file is
+// validated against (k, b, base) and removed once the run completes.
+// ---------------------------------------------------------------------------
+static const char PRP_CKPT_MAGIC[8] = {'N','T','T','P','R','P','0','1'};
+
+static bool save_prp_ckpt(const std::string& path, int k, u64 b, unsigned long a,
+                          u64 next_bit, const std::vector<i64>& res) {
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) { return false; }
+    int kk = k; u64 bb = b, aa = a, N = res.size(), nb = next_bit;
+    bool ok = fwrite(PRP_CKPT_MAGIC, 1, 8, f) == 8;
+    ok = ok && fwrite(&kk, sizeof kk, 1, f) == 1;
+    ok = ok && fwrite(&bb, sizeof bb, 1, f) == 1;
+    ok = ok && fwrite(&aa, sizeof aa, 1, f) == 1;
+    ok = ok && fwrite(&N,  sizeof N,  1, f) == 1;
+    ok = ok && fwrite(&nb, sizeof nb, 1, f) == 1;
+    ok = ok && fwrite(res.data(), sizeof(i64), res.size(), f) == res.size();
+    fclose(f);
+    if (!ok) { remove(tmp.c_str()); return false; }
+    return rename(tmp.c_str(), path.c_str()) == 0;   // atomic replace
+}
+
+// Returns true and fills next_bit/res if a VALID matching checkpoint exists.
+static bool load_prp_ckpt(const std::string& path, int k, u64 b, unsigned long a,
+                          u64& next_bit, std::vector<i64>& res) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { return false; }
+    char magic[8]; int kk = 0; u64 bb = 0, aa = 0, N = 0, nb = 0;
+    bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, PRP_CKPT_MAGIC, 8) == 0;
+    ok = ok && fread(&kk, sizeof kk, 1, f) == 1 && fread(&bb, sizeof bb, 1, f) == 1
+            && fread(&aa, sizeof aa, 1, f) == 1 && fread(&N,  sizeof N,  1, f) == 1
+            && fread(&nb, sizeof nb, 1, f) == 1;
+    if (!ok || kk != k || bb != b || aa != a || N != res.size()) { fclose(f); return false; }
+    ok = fread(res.data(), sizeof(i64), res.size(), f) == res.size();
+    fclose(f);
+    if (ok) { next_bit = nb; }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Stage 4: full strong-PRP powering a^(M-1) mod M on the GPU.  Run the whole
 // chain mod (b^N+1) with the NTT engine (left-to-right binary), reduce to
 // M = (b^N+1)/2 only at the end, and compare the residue AND the prime/composite
-// verdict to GMP's mpz_powm.
+// verdict to GMP's mpz_powm.  Stage 4b: periodic checkpointing + resume.
 // ---------------------------------------------------------------------------
-static int selftest_prp(int k, u64 b, unsigned long base_a) {
+static int selftest_prp(int k, u64 b, unsigned long base_a,
+                        std::string ckpt_path, bool no_ckpt, u64 check_interval) {
     Engine eng;
     if (!eng.init(k, b)) return 2;
     const u64 N = eng.N;
@@ -866,12 +910,32 @@ static int selftest_prp(int k, u64 b, unsigned long base_a) {
     std::vector<i64> acc = mpz_to_digits(a_red, N, b);
     std::vector<i64> res(N, 0); res[0] = 1;
     size_t bits = mpz_sizeinbase(E, 2);
+
+    // Checkpointing is on by default; the name encodes (k,b,base) so it only ever
+    // matches the same run. --no-checkpoint disables it.
+    if (no_ckpt) {
+        ckpt_path.clear();
+    } else if (ckpt_path.empty()) {
+        ckpt_path = "prp.k" + std::to_string(k) + ".b" + std::to_string(b) +
+                    ".a" + std::to_string(base_a) + ".ckpt";
+    }
+    u64 next_bit = bits;   // bits still to process are (next_bit-1) .. 0
+    if (!ckpt_path.empty() && load_prp_ckpt(ckpt_path, k, b, base_a, next_bit, res)) {
+        printf("  resumed from %s at bit %llu/%zu\n",
+               ckpt_path.c_str(), (unsigned long long)next_bit, bits);
+    }
+
     auto t0 = std::chrono::steady_clock::now();
-    for (size_t i = bits; i-- > 0;) {
+    for (size_t i = next_bit; i-- > 0;) {
         res = eng.negamul(res, res, true);
         if (mpz_tstbit(E, (mp_bitcnt_t)i)) res = eng.negamul(res, acc, false);
+        // Checkpoint every check_interval processed bits (i = next bit after this).
+        if (!ckpt_path.empty() && check_interval > 0 && (i % check_interval) == 0) {
+            save_prp_ckpt(ckpt_path, k, b, base_a, (u64)i, res);
+        }
     }
     double gpu_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!ckpt_path.empty()) { remove(ckpt_path.c_str()); }   // completed -> obsolete
     digits_to_mpz(got, res, b); mpz_mod(got, got, M);   // reduce to M at the very end
 
     auto t1 = std::chrono::steady_clock::now();
@@ -939,8 +1003,12 @@ int main(int argc, char** argv) {
     u64 b = 10001;
     int reps = 8;
     unsigned long base_a = 3;
-    std::string mode;
-    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp|bench} [--k K] [--b B] [--base A] [--reps R]\n";
+    std::string mode, ckpt_path;
+    bool no_ckpt = false;
+    u64 check_interval = 1000;    // checkpoint every N processed bits (prp mode)
+    const char* usage = "Usage: %s --selftest {montmul|ntt|negamul|prp|bench} [--k K] [--b B]\n"
+                        "          [--base A] [--reps R] [--checkpoint FILE | --no-checkpoint]\n"
+                        "          [--check-interval N]\n";
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto nx = [&](const char* f) {
@@ -952,12 +1020,15 @@ int main(int argc, char** argv) {
         else if (s == "--b")        b = strtoull(nx("--b"), nullptr, 10);
         else if (s == "--base")     base_a = strtoul(nx("--base"), nullptr, 10);
         else if (s == "--reps")     reps = atoi(nx("--reps"));
+        else if (s == "--checkpoint")     ckpt_path = nx("--checkpoint");
+        else if (s == "--no-checkpoint")  no_ckpt = true;
+        else if (s == "--check-interval") check_interval = strtoull(nx("--check-interval"), nullptr, 10);
         else { fprintf(stderr, usage, argv[0]); return 2; }
     }
     if (mode == "montmul")  return selftest_montmul(k);
     if (mode == "ntt")      return selftest_ntt(k);
     if (mode == "negamul")  return selftest_negamul(k, b, reps);
-    if (mode == "prp")      return selftest_prp(k, b, base_a);
+    if (mode == "prp")      return selftest_prp(k, b, base_a, ckpt_path, no_ckpt, check_interval);
     if (mode == "bench")    return selftest_bench(k, b, reps);
     fprintf(stderr, usage, argv[0]);
     return 2;

@@ -24,9 +24,9 @@ convenience / cross-check oracle. This large-k engine is a separate paradigm:
 single-prime NTT, multi-prime negamul mod `b^N+1`, full `a^(M-1)` PRP powering)
 all match GMP bit-for-bit; stage 5a (CPU post-processing optimisation) reaches the
 **crossover at k=16** on an M2 Pro (1.65× at k=18) — see
-[`../BENCHMARKS.md`](../BENCHMARKS.md). Still open: four-step tiling (§4), and
-Gerbicz–Li + checkpoint (§5 stage 4). The one finding that changed the plan is in
-§2.1 below.
+[`../BENCHMARKS.md`](../BENCHMARKS.md). Checkpoint/resume is done (stage 4b); still
+open: a sound error check (Gerbicz–Li) and the four-step tiling (§4, stage 5b). The
+one finding that changed the plan is in §2.1 below.
 
 ---
 
@@ -190,11 +190,21 @@ behind a `--selftest` mode).
 3. **Multi-prime + CRT + carry — DONE (stage 3).** 2–3 primes, CRT + balanced carry
    on the CPU over shared buffers (§2.1). `--selftest negamul`. Gate met: matches
    GMP `x·y mod (b^N+1)` for k = 4…16, bases up to ~10^9 (multiply and square).
-4. **Powering — DONE as 4a (`--selftest prp`); GEC + checkpoint still TODO (4b).**
-   Full `a^(M−1)` chain, reduced to M only at the end. Gate met: residue + verdict
-   match GMP for k ≤ 12. Gerbicz–Li every ~1000 squarings and a resumable residue
-   journal (mirror `prp_test`) are **not yet built** — required before trusting
-   long large-k runs.
+4. **Powering — DONE as 4a; checkpoint/resume DONE as 4b; error check still TODO.**
+   Full `a^(M−1)` chain, reduced to M only at the end (`--selftest prp`). Gate met:
+   residue + verdict match GMP for k ≤ 12, including after a resume.
+   - **Checkpoint/resume (done).** The residue + loop position are persisted
+     atomically every `--check-interval` bits (default 1000), validated against
+     (k,b,base), resumed automatically, and removed on completion; `--no-checkpoint`
+     opts out. Verified: a killed k=10 run resumes from bit 6000/10206 and still
+     matches GMP. So a multi-day run survives a crash/reboot/Ctrl-C.
+   - **Error check (still TODO).** A *sound* transient-error detector needs
+     **Gerbicz–Li** (a multiplicative identity checked *mod M*, which the engine
+     itself evaluates mod M). A naive "track the residue mod a small prime q" does
+     **not** work here: the residue is reduced mod `b^N+1`, so `R = X − m·(b^N+1)`
+     and `R mod q` depends on the unknown `m` — it cannot be predicted by an
+     independent mod-q powering. (This is exactly why Gerbicz was needed; there is
+     no cheap independent-modulus shortcut for a modular exponentiation.)
 5. **Benchmark + crossover — DONE as 5a.** `--selftest bench` reports ms/squaring,
    GPU vs one GMP core, with a GPU-vs-CPU-post breakdown. **Crossover at k=16** on
    the M2 Pro, 1.65× at k=18; recorded in [`../BENCHMARKS.md`](../BENCHMARKS.md).
