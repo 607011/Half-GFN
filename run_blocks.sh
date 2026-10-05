@@ -32,6 +32,8 @@
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
 #   --bases "..."  PRP bases (default: first 13 primes, "2 3 5 ... 41")
 #   --ecpp         prove with ECPP instead of APR-CL
+#   --primecert    prove with resumable ECPP (prove.sh --primecert): the proof
+#                  checkpoints its descent, so a days-long large-k proof can resume
 #   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
 #   -y | --yes     recompute/overwrite already-computed blocks without asking
 #   --gpu          run the PRP stage on the GPU NTT engine (ntt_metal, Fermat PRP);
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
         --plimit) PLIMIT="$2"; shift 2 ;;
         --bases)  BASES="$2"; shift 2 ;;
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
+        --primecert) METHOD="ecpp-primecert"; PROVE_FLAG="--primecert"; shift ;;
         -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --gpu)    GPU=1; shift ;;

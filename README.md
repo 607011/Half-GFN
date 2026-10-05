@@ -230,6 +230,7 @@ Deterministic primality **proof** of the PRP survivors, via PARI/GP's `isprime`
 | `--limit N` | `0` (all) | prove only the first `N` bases |
 | `--out FILE` | `primes.txt` | output file for proven-prime bases |
 | `--ecpp` | off | use ECPP (`isprime(.,2)`, yields a certificate; often faster for very large numbers) |
+| `--primecert` | off | **resumable** ECPP: build the descent in checkpointed chunks (`primecert`), so a proof that runs for hours/days survives a crash and resumes; each result is verified with `primecertisvalid`. For large k; keep plain `isprime` for small. |
 | `--stack BYTES` | `2000000000` | PARI stack size (`parisizemax` grows up to 8× this) |
 | `--journal FILE` | *(off)* | enable journaling / resume |
 

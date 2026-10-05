@@ -26,6 +26,11 @@
 #   --out FILE     write the proven prime bases here (default primes.txt)
 #   --ecpp         ECPP instead of APR-CL (isprime(.,2); yields a certificate,
 #                  often faster for very large numbers)
+#   --primecert    resumable ECPP via primecert: build the Atkin-Morain descent in
+#                  chunks, checkpointing the partial certificate after each, so a
+#                  proof that runs for hours/days survives a crash and resumes
+#                  (checkpoints in prove_work/cert_<N>_<b>.gp). Each proof is
+#                  verified with primecertisvalid. Use for large k; isprime for small.
 #   --stack BYTES  PARI stack size (default 2000000000 = ~2 GB)
 #   --journal FILE journaling is ON by default (file "<infile>.journal"); every
 #                  proved/tested base is logged immediately and skipped on a rerun
@@ -41,6 +46,7 @@ EXP=""
 LIMIT=0
 OUT="primes.txt"
 FLAG=0                    # 0 = isprime default (APR-CL), 2 = ECPP
+PRIMECERT=0               # 1 = resumable ECPP via primecert (checkpointed descent)
 STACK=2000000000
 JOURNAL=""
 NO_JOURNAL=0
@@ -54,6 +60,7 @@ while [ $# -gt 0 ]; do
         --limit)  LIMIT="$2"; shift 2 ;;
         --out)    OUT="$2"; shift 2 ;;
         --ecpp)   FLAG=2; shift ;;
+        --primecert) PRIMECERT=1; shift ;;
         --stack)  STACK="$2"; shift 2 ;;
         --journal) JOURNAL="$2"; shift 2 ;;
         --no-journal) NO_JOURNAL=1; shift ;;
@@ -110,11 +117,54 @@ else
 fi
 NB=$(wc -l < "$BASES" | tr -d ' ')
 
-METHOD=$([ "$FLAG" -eq 2 ] && echo "ECPP" || echo "APR-CL")
+if [ "$PRIMECERT" -eq 1 ]; then METHOD="ECPP/primecert (resumable)";
+else METHOD=$([ "$FLAG" -eq 2 ] && echo "ECPP" || echo "APR-CL"); fi
 
 # Note: generate the GP script without "\\" comments -- in an unquoted heredoc
 # bash would shorten "\\" to "\" and GP would misread it as a command.
-cat > "$SCRIPT" <<GP
+if [ "$PRIMECERT" -eq 1 ]; then
+    # Resumable ECPP: build the Atkin-Morain descent in chunks (primecert with a
+    # decreasing partial threshold), persisting the partial certificate after each
+    # chunk. A killed run resumes from the last chunk. Each proof is validated with
+    # primecertisvalid. Cert files are named by (exponent, b) so a stale cert for a
+    # different M is never reused (also guarded by CC[1][1] == M).
+    cat > "$SCRIPT" <<GP
+default(parisizemax, $((STACK * 8)));
+N = $EXP;
+cdir = "$WORK";
+v = readvec("$BASES");
+frontier(X) = if(type(X)=="t_INT", #binary(X), my(L=X[#X]); #binary((L[1]+1-L[2])/L[3]));
+chkpt(f) = { my(t=Str(f,".tmp")); system(Str("rm -f ",t)); write(t,"CC=",CC,";"); system(Str("mv -f ",t," ",f)); };
+proveM(M, f) = {
+   CC = M;
+   iferr(read(f), e, 0);
+   if(type(CC) != "t_INT" && CC[1][1] != M, CC = M);
+   while(frontier(CC) > 64,
+      my(p = max(frontier(CC)\2, 64));
+      CC = primecert(CC, 0, p);
+      if(CC == 0, return(0));
+      chkpt(f);
+   );
+   CC = primecert(CC);
+   if(CC == 0, return(0));
+   chkpt(f);
+   if(type(CC) == "t_INT", 1, primecertisvalid(CC));
+};
+{
+for(i = 1, #v,
+    b = v[i];
+    M = (b^N + 1)/2;
+    f = Str(cdir, "/cert_", N, "_", b, ".gp");
+    gettime();
+    r = proveM(M, f);
+    dt = gettime();
+    if(r, system(Str("rm -f ", f)));
+    print("RESULT ", b, " ", r, " ", dt);
+);
+}
+GP
+else
+    cat > "$SCRIPT" <<GP
 default(parisizemax, $((STACK * 8)));
 N = $EXP;
 v = readvec("$BASES");
@@ -129,6 +179,7 @@ for(i = 1, #v,
 );
 }
 GP
+fi
 
 echo "Proof:       $METHOD (PARI/GP, ARM-native)"
 if [ -n "$JOURNAL" ]; then

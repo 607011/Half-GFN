@@ -52,15 +52,15 @@ Until then: owner's own machines only, trusted, no verification needed.
   speed only) and a sound error check (Gerbicz–Li). The CUDA sibling for the RTX
   4060 is the separate item above (design in
   [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md)).
-- **Checkpointable large-k proofs via `primecert`.** `isprime` is single-shot (no
-  resume), which becomes painful when one proof runs for days. PARI's
-  `primecert(N, 0, partial)` returns a *partial* ECPP certificate — a prefix of the
-  Atkin-Morain descent chain. Persist it, resume by certifying the last remaining
-  `N_i` and appending, so every completed descent step is a durable checkpoint.
-  Bonus: the resulting certificate is independently checkable with
-  `primecertisvalid`, so this doubles as the verification primitive for the
-  distributed/cross-verification item above (verify a cert cheaply instead of
-  re-proving). Switch `prove.sh` to this for large k; keep plain `isprime` for small.
+- **Checkpointable large-k proofs via `primecert` — DONE.** `prove.sh --primecert`
+  (and `run_blocks.sh --primecert`) builds the Atkin-Morain ECPP descent in chunks
+  with `primecert(C, 0, partial)` at a decreasing threshold, persisting the partial
+  certificate after each chunk (`prove_work/cert_<N>_<b>.gp`), so a proof that runs
+  for hours/days survives a crash and resumes from the last chunk. Each proof is
+  verified with `primecertisvalid`; cert files are keyed by (exponent, b) and
+  guarded by `CC[1][1] == M` so a stale certificate is never reused. Kept plain
+  `isprime` (APR-CL) as the default for small k. (The certificate is also the
+  verification primitive for the distributed/cross-verification item above.)
 - **Auto-renew leases** from the long-running tools: have `hgfn_sieve` (at each
   checkpoint) and `prove.sh` call `coverage.sh renew`, so the lease TTL can be short
   while a live worker keeps its claim fresh.
