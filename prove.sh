@@ -24,13 +24,16 @@
 #   --exp N        override the exponent (otherwise from the header)
 #   --limit N      prove only the first N bases (0 = all)
 #   --out FILE     write the proven prime bases here (default primes.txt)
-#   --ecpp         ECPP instead of APR-CL (isprime(.,2); yields a certificate,
-#                  often faster for very large numbers)
-#   --primecert    resumable ECPP via primecert: build the Atkin-Morain descent in
-#                  chunks, checkpointing the partial certificate after each, so a
+# The proof method is chosen AUTOMATICALLY by number size unless one of the next
+# three is given: small -> isprime/APR-CL, large (>= ~3000 digits) -> resumable ECPP.
+#   --aprcl        force APR-CL (isprime default)
+#   --ecpp         force ECPP (isprime(.,2); yields a certificate, often faster for
+#                  very large numbers)
+#   --primecert    force resumable ECPP via primecert: build the Atkin-Morain descent
+#                  in chunks, checkpointing the partial certificate after each, so a
 #                  proof that runs for hours/days survives a crash and resumes
 #                  (checkpoints in prove_work/cert_<N>_<b>.gp). Each proof is
-#                  verified with primecertisvalid. Use for large k; isprime for small.
+#                  verified with primecertisvalid.
 #   --stack BYTES  initial PARI stack (default ~1 GB); grows on demand up to --maxmem
 #   --maxmem BYTES parisizemax cap (default ~3/4 of physical RAM). Bounds gp's memory
 #                  so a large-k proof (k>=11 can need many GB) cannot swallow all RAM
@@ -50,6 +53,8 @@ LIMIT=0
 OUT="primes.txt"
 FLAG=0                    # 0 = isprime default (APR-CL), 2 = ECPP
 PRIMECERT=0               # 1 = resumable ECPP via primecert (checkpointed descent)
+METHOD_SET=0              # 1 once a method flag is given; else choose automatically
+AUTO_CERT_DIGITS=3000     # auto: at >= this many decimal digits, use resumable ECPP
 STACK=1000000000         # initial PARI stack (-s); grows on demand up to MAXMEM
 MAXMEM=""                # parisizemax cap in bytes; empty = RAM-aware default
 JOURNAL=""
@@ -63,8 +68,9 @@ while [ $# -gt 0 ]; do
         --exp)    EXP="$2"; shift 2 ;;
         --limit)  LIMIT="$2"; shift 2 ;;
         --out)    OUT="$2"; shift 2 ;;
-        --ecpp)   FLAG=2; shift ;;
-        --primecert) PRIMECERT=1; shift ;;
+        --aprcl)  FLAG=0; PRIMECERT=0; METHOD_SET=1; shift ;;
+        --ecpp)   FLAG=2; METHOD_SET=1; shift ;;
+        --primecert) PRIMECERT=1; METHOD_SET=1; shift ;;
         --stack)  STACK="$2"; shift 2 ;;
         --maxmem) MAXMEM="$2"; shift 2 ;;
         --journal) JOURNAL="$2"; shift 2 ;;
@@ -126,6 +132,20 @@ if [ "$NALL" -eq 0 ]; then
     [ -n "$JOURNAL" ] && rm -f "$JOURNAL"
     echo "No bases in $INFILE -- nothing to prove (0 proven)."
     exit 0
+fi
+
+# Auto method: without an explicit --aprcl/--ecpp/--primecert, pick by size. Small
+# numbers -> isprime (APR-CL), fast and simple. Large numbers -> resumable ECPP
+# (primecert), because the proof then runs long enough that crash-resume matters.
+AUTO_NOTE=""
+if [ "$METHOD_SET" -eq 0 ]; then
+    maxb=$(sort -n "$ALL" | tail -1)
+    DIGITS=$(awk -v n="$EXP" -v b="$maxb" 'BEGIN { printf "%d", n * log(b) / log(10) }')
+    if [ "${DIGITS:-0}" -ge "$AUTO_CERT_DIGITS" ]; then
+        PRIMECERT=1; AUTO_NOTE=" [auto: ~$DIGITS digits >= $AUTO_CERT_DIGITS]"
+    else
+        AUTO_NOTE=" [auto: ~$DIGITS digits]"
+    fi
 fi
 
 # Journal (resume): drop bases already tested (column 1).
@@ -202,7 +222,7 @@ for(i = 1, #v,
 GP
 fi
 
-echo "Proof:       $METHOD (PARI/GP, ARM-native)"
+echo "Proof:       $METHOD (PARI/GP, ARM-native)$AUTO_NOTE"
 echo "Memory:      parisizemax $(( MAXMEM / 1024 / 1024 )) MiB (initial stack $(( STACK / 1024 / 1024 )) MiB)"
 if [ -n "$JOURNAL" ]; then
     echo "Candidates:  $NALL total, $NDONE done per journal, $NB to prove  (from $INFILE)"

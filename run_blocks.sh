@@ -31,9 +31,11 @@
 #                  block), e.g. --bmin 0 --bmax 999 --block 1000.
 #   --plimit P     sieve limit (default 1e7)        [must be < M(bmin)!]
 #   --bases "..."  PRP bases (default: first 13 primes, "2 3 5 ... 41")
-#   --ecpp         prove with ECPP instead of APR-CL
-#   --primecert    prove with resumable ECPP (prove.sh --primecert): the proof
-#                  checkpoints its descent, so a days-long large-k proof can resume
+#   (proof method is AUTOMATIC by size unless forced: small -> APR-CL, large
+#    (>= ~3000 digits) -> resumable ECPP; memory is auto-capped to ~3/4 RAM)
+#   --aprcl        force APR-CL for the proof
+#   --ecpp         force plain ECPP for the proof
+#   --primecert    force resumable ECPP (checkpointed descent; survives a crash)
 #   --maxmem BYTES cap the prover's memory (prove.sh --maxmem); default ~3/4 of RAM,
 #                  so a large-k proof cannot swap the machine
 #   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
@@ -56,6 +58,7 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 BLOCK=1000000
 K=""; BMIN=""; BMAX=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
+EXTRA_FLAG=""; METHOD_SET=0
 BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
 VERBOSE=0; VFLAG=""; ASSUME_YES=0; GPU=0
 
@@ -69,9 +72,10 @@ while [ $# -gt 0 ]; do
         --block)  BLOCK="$2"; shift 2 ;;
         --plimit) PLIMIT="$2"; shift 2 ;;
         --bases)  BASES="$2"; shift 2 ;;
-        --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
-        --primecert) METHOD="ecpp-primecert"; PROVE_FLAG="--primecert"; shift ;;
-        --maxmem) PROVE_FLAG="$PROVE_FLAG --maxmem $2"; shift 2 ;;
+        --aprcl)  METHOD="aprcl"; PROVE_FLAG="--aprcl"; METHOD_SET=1; shift ;;
+        --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; METHOD_SET=1; shift ;;
+        --primecert) METHOD="ecpp-primecert"; PROVE_FLAG="--primecert"; METHOD_SET=1; shift ;;
+        --maxmem) EXTRA_FLAG="$EXTRA_FLAG --maxmem $2"; shift 2 ;;
         -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --gpu)    GPU=1; shift ;;
@@ -222,15 +226,24 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     fi
 
     # --- Stage 3: proof (always; persistent journal for intra-block resume) ---
+    # Auto method unless the user forced one: large numbers (>= ~3000 digits) -> the
+    # resumable ECPP (primecert), small -> APR-CL. Matches prove.sh's own auto, but
+    # resolved here too so the coverage/results method label is accurate.
+    pflag="$PROVE_FLAG"; pmethod="$METHOD"
+    if [ "$METHOD_SET" -eq 0 ]; then
+        pdigits=$(awk -v n="$N" -v b="$end" 'BEGIN { printf "%d", n * log(b) / log(10) }')
+        if [ "${pdigits:-0}" -ge 3000 ]; then pflag="--primecert"; pmethod="ecpp-primecert";
+        else pflag="--aprcl"; pmethod="aprcl"; fi
+    fi
     PR=$(mktemp)
-    ./prove.sh $PROVE_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
+    ./prove.sh $pflag $EXTRA_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
         | awk '{ print "[PROVE]", $0; fflush() }' >&3
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
-    { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start..$end]"
+    { echo "# proven primes: b with (b^$N+1)/2 prime ($pmethod), block [$start..$end]"
       grep '^[0-9]' "$PR" || true; } > "results/primes/k$K/${start}-${end}.txt"
 
-    ./coverage.sh record "$K" "$start" "$end" proof "method=$METHOD" "$nprimes" >/dev/null
+    ./coverage.sh record "$K" "$start" "$end" proof "method=$pmethod" "$nprimes" >/dev/null
 
     if [ "$nprimes" -gt 0 ]; then
         maxb=$(grep '^[0-9]' "$PR" | sort -n | tail -1)
@@ -240,7 +253,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     fi
     date=$(date -u +%Y-%m-%d); commit=$(git rev-parse --short HEAD 2>/dev/null || echo -); host=$(hostname -s 2>/dev/null || echo -)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$date" "$K" "$start" "$end" "$nprimes" "$dig" "$METHOD" "$commit" "$host" >> results/primes.tsv
+        "$date" "$K" "$start" "$end" "$nprimes" "$dig" "$pmethod" "$commit" "$host" >> results/primes.tsv
 
     # Block proved: drop the proof scratch, the PRP staging file (proof-queue
     # convention: the verified result now lives in results/primes/) and the
