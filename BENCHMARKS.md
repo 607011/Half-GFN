@@ -150,3 +150,34 @@ transform itself — four-step tiling (stage 5b) shortens an already-small part.
 ninja -C build ntt_metal
 for k in 13 14 15 16 17 18; do ./build/ntt_metal --selftest bench --k $k --b 101 --reps 60; done
 ```
+
+---
+
+## 2026-10-05 — reciprocal carry (division-free CPU post-processing)
+
+Profiling the CPU post-processing (`--selftest bench` now splits it) showed the
+**carry**, not the CRT, dominates it: at k=18, carry 4.41 ms vs CRT 0.62 ms (~88%).
+The carry's cost was two hardware divisions by b per coefficient (`v%b`, `v/b`).
+Replaced both with one multiply-high against a precomputed reciprocal
+`recip = ceil(2^64/b)` plus a one-step correction (balanced round-division identity
+for odd b). Same result, verified bit-for-bit against GMP (negamul + prp).
+
+ms/squaring, GPU vs one GMP core, b=101, 60 iters, M2 Pro, BOINC off:
+
+| k | GPU before | GPU after | speedup before | speedup after | carry before→after |
+|---|-----------:|----------:|:--------------:|:-------------:|:------------------:|
+| 15 | 1.236 | 1.117 | 0.94× | **1.05×** | — |
+| 16 | 2.335 | 1.928 | 1.17× | **1.41×** | 1.11 → 0.55 ms |
+| 17 | 3.586 | 2.952 | 1.60× | **1.92×** | 2.22 → 1.11 ms |
+| 18 | 6.820 | 4.975 | 1.73× | **2.36×** | 4.41 → 2.22 ms |
+
+The carry roughly halved; the GPU-vs-CPU crossover dropped from k=16 to **k=15**,
+and the win at k=18 rose to **2.36×**. The carry is still the largest single CPU-post
+component (sequential chain); further gains would need a parallel carry (multi-thread
+or GPU) — a bigger, correctness-critical step for a smaller remaining slice.
+
+**Reproduce.**
+```bash
+ninja -C build ntt_metal
+for k in 13 14 15 16 17 18; do ./build/ntt_metal --selftest bench --k $k --b 101 --reps 60; done
+```

@@ -595,6 +595,36 @@ static std::vector<i64> carry_balanced(const std::vector<T>& c, u64 b) {
     return out;
 }
 
+// Fast i64 balanced carry: replaces the two hardware divisions per coefficient
+// (v%b and v/b) with one multiply-high against a precomputed reciprocal
+// recip = ceil(2^64 / b). This is the dominant cost of the CPU post-processing at
+// large k (profiled ~88%). Uses the balanced round-division identity for odd b:
+//   round(v/b) = sign(v) * floor((|v| + (b-1)/2) / b),  rem = v - round(v/b)*b.
+// floor(u/b) for u in [0, 2^63) is mulhi(u, recip) with a single -1 correction.
+// Valid for the 2-prime path where |coefficients| < p0*p1 < 2^62; mathematically
+// identical to carry_balanced<i64> (gated bit-for-bit against GMP).
+static std::vector<i64> carry_balanced_recip(const std::vector<i64>& c, u64 b, u64 recip) {
+    const i64 bb = (i64)b;
+    const u64 h = (b - 1) / 2;                 // b is odd -> exact
+    std::vector<i64> d = c;
+    const u64 N = d.size();
+    for (int guard = 0; guard < 128; ++guard) {
+        i64 carry = 0;
+        for (u64 j = 0; j < N; ++j) {
+            i64 v = d[j] + carry;
+            u64 a = (u64)(v < 0 ? -v : v) + h;                 // |v| + (b-1)/2
+            u64 qa = (u64)(((unsigned __int128)a * recip) >> 64);
+            if (qa * b > a) --qa;                               // -> floor(a/b)
+            i64 q = (v < 0) ? -(i64)qa : (i64)qa;               // round(v/b)
+            d[j] = v - q * bb;                                  // balanced remainder
+            carry = q;
+        }
+        if (carry == 0) break;
+        d[0] -= carry;                 // b^N == -1
+    }
+    return d;
+}
+
 static void digits_to_mpz(mpz_t out, const std::vector<i64>& d, u64 b) {
     mpz_set_ui(out, 0);
     for (size_t j = d.size(); j-- > 0;) {
@@ -642,7 +672,9 @@ struct Engine {
     id<MTLBuffer> bInX, bInY, bW, bFx, bFy, bT;
     u32 ln = 0, nn = 0;
     CrtPlan crt;                    // precomputed Garner constants (primes fixed)
+    u64 b_recip = 0;                // ceil(2^64 / b), for division-free balanced carry
     double t_gpu = 0, t_cpu = 0;    // profiling accumulators (GPU work vs CPU post)
+    double t_crt = 0, t_carry = 0;  // CPU-post split: CRT reconstruction vs carry
 
     id<MTLBuffer> mkbuf(const void* src, size_t bytes) {
         return src ? [dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
@@ -705,6 +737,7 @@ struct Engine {
             G.push_back(g);
         }
         crt = make_crt_plan(primes);
+        b_recip = (~0ULL) / b + 1;   // ceil(2^64 / b)  (b odd >= 3)
         return true;
     }
 
@@ -804,7 +837,11 @@ struct Engine {
                     u64 v = r0 + p0 * mulmod((u64)d, inv, p1);
                     c[j] = ((i64)v > Phalf) ? (i64)v - (i64)P : (i64)v;
                 }
-                result = carry_balanced<i64>(c, b);
+                auto tcar = std::chrono::steady_clock::now();
+                t_crt += std::chrono::duration<double, std::milli>(tcar - tc).count();
+                result = carry_balanced_recip(c, b, b_recip);
+                t_carry += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - tcar).count();
             } else {
                 std::vector<i128> c(N);
                 std::vector<u32> col(primes.size());
@@ -812,7 +849,11 @@ struct Engine {
                     for (size_t pi = 0; pi < primes.size(); ++pi) col[pi] = cres[pi][j];
                     c[j] = crt_balanced(col, primes, crt);
                 }
+                auto tcar = std::chrono::steady_clock::now();
+                t_crt += std::chrono::duration<double, std::milli>(tcar - tc).count();
                 result = carry_balanced<i128>(c, b);
+                t_carry += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - tcar).count();
             }
             t_cpu += std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - tc).count();
@@ -987,7 +1028,7 @@ static int selftest_bench(int k, u64 b, int iters) {
     // GPU: iters back-to-back squarings.
     std::vector<i64> r = x;
     r = eng.negamul(r, r, true);                 // warm up
-    eng.t_gpu = 0; eng.t_cpu = 0;
+    eng.t_gpu = 0; eng.t_cpu = 0; eng.t_crt = 0; eng.t_carry = 0;
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; ++i) r = eng.negamul(r, r, true);
     double gpu_ms = std::chrono::duration<double, std::milli>(
@@ -1010,8 +1051,8 @@ static int selftest_bench(int k, u64 b, int iters) {
            k, (unsigned long long)N, (unsigned long long)b, eng.primes.size(), iters);
     printf("  GPU %.3f ms/sq   CPU/GMP(1 core) %.3f ms/sq   speedup %.2fx\n",
            gpu_ms, cpu_ms, cpu_ms / gpu_ms);
-    printf("  [breakdown] GPU dispatch+wait %.3f ms   CPU CRT+carry %.3f ms\n",
-           gpu_part, cpu_part);
+    printf("  [breakdown] GPU dispatch+wait %.3f ms   CPU CRT+carry %.3f ms (CRT %.3f + carry %.3f)\n",
+           gpu_part, cpu_part, eng.t_crt / iters, eng.t_carry / iters);
     return 0;
 }
 
