@@ -128,32 +128,32 @@ done
 # (a) Report blocks with partial results (sieve/PRP present, proof pending). They
 # are recomputed either way (no proof yet) -- this is informational only.
 if [ "${#partial_blocks[@]}" -gt 0 ]; then
-    echo "note: ${#partial_blocks[@]} block(s) in [$BMIN,$BMAX] have partial results" \
+    echo "[BLOCK] note: ${#partial_blocks[@]} block(s) in [$BMIN,$BMAX] have partial results" \
          "(sieve/PRP recorded, proof pending) and will be (re)computed:"
     show=6; [ "${#partial_blocks[@]}" -lt "$show" ] && show="${#partial_blocks[@]}"
     for (( i=0; i<show; i++ )); do
         ps="${partial_blocks[$i]}"; pe=$(( ps + BLOCK - 1 < BMAX ? ps + BLOCK - 1 : BMAX ))
-        echo "  k=$K block [$ps..$pe]"
+        echo "[BLOCK]   k=$K block [$ps..$pe]"
     done
-    [ "${#partial_blocks[@]}" -gt "$show" ] && echo "  ... and $(( ${#partial_blocks[@]} - show )) more"
+    [ "${#partial_blocks[@]}" -gt "$show" ] && echo "[BLOCK]   ... and $(( ${#partial_blocks[@]} - show )) more"
 fi
 
 if [ "${#done_blocks[@]}" -gt 0 ]; then
     first="${done_blocks[0]}"; last="${done_blocks[${#done_blocks[@]}-1]}"
     if [ "$ASSUME_YES" -eq 1 ]; then
         OVERWRITE=1
-        echo "note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> recomputing and overwriting (-y)."
+        echo "[BLOCK] note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> recomputing and overwriting (-y)."
     elif [ -t 0 ]; then
-        echo "k=$K: ${#done_blocks[@]} of the requested blocks are already computed" \
+        echo "[BLOCK] k=$K: ${#done_blocks[@]} of the requested blocks are already computed" \
              "(first start=$first, last start=$last)."
         printf "Recompute and overwrite them? [y/N] "
         read -r ans || ans=""
         case "$ans" in
             y|Y|yes|YES|Yes) OVERWRITE=1 ;;
-            *) OVERWRITE=0; echo "Keeping existing results; computing only the missing blocks." ;;
+            *) OVERWRITE=0; echo "[BLOCK] Keeping existing results; computing only the missing blocks." ;;
         esac
     else
-        echo "note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> skipping them." \
+        echo "[BLOCK] note: ${#done_blocks[@]} block(s) in [$BMIN,$BMAX] already computed -> skipping them." \
              "Use -y to recompute and overwrite." >&2
     fi
 fi
@@ -173,7 +173,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     # --- block level: already proved? -> skip, unless the user chose to overwrite ---
     if [ "$OVERWRITE" -eq 0 ] && awk -F'\t' -v k="$K" -v s="$start" -v e="$end" \
         '$2==k && $3==s && $4==e && $5=="proof" { f=1 } END { exit f?0:1 }' coverage.tsv 2>/dev/null; then
-        echo "k=$K block [$start..$end]: already proved -> skipped"
+        echo "[BLOCK] k=$K block [$start..$end]: already proved -> skipped"
         continue
     fi
 
@@ -187,7 +187,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     # --- Stage 1: sieve (reuse banked candidates if present) ---
     if [ "$OVERWRITE" -eq 0 ] && [ -f "$cand_file" ] && has_stage sieve; then
         nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
-        echo "k=$K block [$start..$end]: reusing banked candidates ($nsieve)"
+        echo "[BLOCK] k=$K block [$start..$end]: reusing banked candidates ($nsieve)"
     else
         # safety guard: the sieve is correct only if M(bmin) > plimit
         if ! awk -v n="$N" -v b="$bmin" -v p="$PLIMIT" \
@@ -206,7 +206,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     # --- Stage 2: PRP (reuse banked survivors if present) ---
     if [ "$OVERWRITE" -eq 0 ] && [ -f "$prp_file" ] && has_stage prp; then
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
-        echo "k=$K block [$start..$end]: reusing banked PRP survivors ($nprp)"
+        echo "[BLOCK] k=$K block [$start..$end]: reusing banked PRP survivors ($nprp)"
     elif [ "$GPU" -eq 1 ]; then
         # GPU path: NTT-accelerated Fermat PRP (ntt_metal). Sound as a pre-proof
         # filter -- it drops no primes; a few extra Fermat pseudoprimes just reach
@@ -260,5 +260,5 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     # intra-block journal. Keep the banked candidates (reproducible, gitignored,
     # reusable for a re-PRP with other bases).
     rm -f "$PR" "$prp_file" "$journal"
-    echo "k=$K block [$start..$end]: sieve=$nsieve prp=$nprp primes=$nprimes (max $dig digits)"
+    echo "[BLOCK] k=$K block [$start..$end]: sieve=$nsieve prp=$nprp primes=$nprimes (max $dig digits)"
 done
