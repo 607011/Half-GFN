@@ -55,6 +55,9 @@ endif()
 add_library(hgfn_flags INTERFACE)
 if(MSVC)
     target_compile_options(hgfn_flags INTERFACE /W3)
+    # fopen() is ISO C and used portably (fopen_s is MSVC-only); silence the
+    # MSVC-specific C4996 deprecation warning instead of forking the code.
+    target_compile_definitions(hgfn_flags INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(hgfn_flags INTERFACE -Wall)
     if(HGFN_NATIVE)
@@ -77,6 +80,11 @@ target_link_libraries(hgfn_sieve PRIVATE hgfn_flags Threads::Threads)
 add_executable(prp_test prp_test.cpp)
 target_link_libraries(prp_test PRIVATE hgfn_flags Threads::Threads GMP::GMP)
 
+# Stage 1 reference for the large-k GPU engine: CPU negacyclic-NTT squaring
+# mod (b^N+1), validated against GMP. CPU-only; see docs/cuda-largek-prp.md.
+add_executable(ntt_ref ntt_ref.cpp)
+target_link_libraries(ntt_ref PRIVATE hgfn_flags GMP::GMP)
+
 # Optional: GPU-accelerated PRP test via Apple Metal (macOS only, Regime A).
 if(APPLE)
     find_library(METAL_FRAMEWORK Metal)
@@ -87,10 +95,22 @@ if(APPLE)
             COMPILE_OPTIONS "-fobjc-arc")
         target_link_libraries(prp_metal PRIVATE
             hgfn_flags GMP::GMP ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+
+        # Large-k NTT PRP engine for Apple Silicon (see docs/metal-largek-prp.md).
+        # Work in progress; built incrementally, each stage gated vs. ntt_ref.
+        add_executable(ntt_metal ntt_metal.mm)
+        set_source_files_properties(ntt_metal.mm PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(ntt_metal PRIVATE
+            hgfn_flags GMP::GMP ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
     else()
         message(STATUS "Metal/Foundation not found -- skipping prp_metal.")
     endif()
 endif()
+
+# The CUDA PRP engine (prp_cuda.cu) lives on the `cuda` branch, not on main: it has
+# not yet been compiled/verified on an NVIDIA GPU. Build and verify it on the target
+# (RTX 4060) first; only then bring it to main.
 
 # Stage 3 (prove.sh) needs PARI/GP's `gp` binary at runtime, not at build time.
 find_program(GP_EXECUTABLE gp)

@@ -46,7 +46,9 @@ Until then: owner's own machines only, trusted, no verification needed.
   divergence penalty seen with multiple bases on Metal).
 - **FFT/NTT GPU PRP for large k** (tens of thousands of digits) — one big squaring
   spread across the GPU, à la `genefer`/`gpuOwl`; the current one-thread-per-candidate
-  kernel is only for medium sizes.
+  kernel is only for medium sizes. Design written up in
+  [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md); the medium-k prototype's
+  loss to the CPU is measured in [`BENCHMARKS.md`](BENCHMARKS.md).
 - **Checkpointable large-k proofs via `primecert`.** `isprime` is single-shot (no
   resume), which becomes painful when one proof runs for days. PARI's
   `primecert(N, 0, partial)` returns a *partial* ECPP certificate — a prefix of the
