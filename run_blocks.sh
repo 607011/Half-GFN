@@ -34,6 +34,8 @@
 #   --ecpp         prove with ECPP instead of APR-CL
 #   --primecert    prove with resumable ECPP (prove.sh --primecert): the proof
 #                  checkpoints its descent, so a days-long large-k proof can resume
+#   --maxmem BYTES cap the prover's memory (prove.sh --maxmem); default ~3/4 of RAM,
+#                  so a large-k proof cannot swap the machine
 #   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
 #   -y | --yes     recompute/overwrite already-computed blocks without asking
 #   --gpu          run the PRP stage on the GPU NTT engine (ntt_metal, Fermat PRP);
@@ -69,6 +71,7 @@ while [ $# -gt 0 ]; do
         --bases)  BASES="$2"; shift 2 ;;
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; shift ;;
         --primecert) METHOD="ecpp-primecert"; PROVE_FLAG="--primecert"; shift ;;
+        --maxmem) PROVE_FLAG="$PROVE_FLAG --maxmem $2"; shift 2 ;;
         -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --gpu)    GPU=1; shift ;;

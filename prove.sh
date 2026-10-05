@@ -31,7 +31,10 @@
 #                  proof that runs for hours/days survives a crash and resumes
 #                  (checkpoints in prove_work/cert_<N>_<b>.gp). Each proof is
 #                  verified with primecertisvalid. Use for large k; isprime for small.
-#   --stack BYTES  PARI stack size (default 2000000000 = ~2 GB)
+#   --stack BYTES  initial PARI stack (default ~1 GB); grows on demand up to --maxmem
+#   --maxmem BYTES parisizemax cap (default ~3/4 of physical RAM). Bounds gp's memory
+#                  so a large-k proof (k>=11 can need many GB) cannot swallow all RAM
+#                  and swap the machine; if a proof needs more it fails cleanly.
 #   --journal FILE journaling is ON by default (file "<infile>.journal"); every
 #                  proved/tested base is logged immediately and skipped on a rerun
 #                  (resume). The journal is removed once all candidates are proved;
@@ -47,7 +50,8 @@ LIMIT=0
 OUT="primes.txt"
 FLAG=0                    # 0 = isprime default (APR-CL), 2 = ECPP
 PRIMECERT=0               # 1 = resumable ECPP via primecert (checkpointed descent)
-STACK=2000000000
+STACK=1000000000         # initial PARI stack (-s); grows on demand up to MAXMEM
+MAXMEM=""                # parisizemax cap in bytes; empty = RAM-aware default
 JOURNAL=""
 NO_JOURNAL=0
 INTERRUPTED=0
@@ -62,6 +66,7 @@ while [ $# -gt 0 ]; do
         --ecpp)   FLAG=2; shift ;;
         --primecert) PRIMECERT=1; shift ;;
         --stack)  STACK="$2"; shift 2 ;;
+        --maxmem) MAXMEM="$2"; shift 2 ;;
         --journal) JOURNAL="$2"; shift 2 ;;
         --no-journal) NO_JOURNAL=1; shift ;;
         -h|--help) usage 0 ;;
@@ -70,6 +75,22 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -z "$INFILE" ] && INFILE="prp.txt"
+
+# Memory cap (parisizemax). PARI grows its stack on demand up to this bound, so a
+# large-k proof (k>=11 can need many GB) must not be allowed to swallow all RAM and
+# swap the machine to a halt. Default: ~3/4 of physical RAM, so it leaves headroom
+# and -- if the proof needs more than that -- fails cleanly ("the PARI stack
+# overflows") instead of thrashing. Override with --maxmem BYTES.
+if [ -z "$MAXMEM" ]; then
+    RAM=0
+    if [ "$(uname)" = "Darwin" ]; then
+        RAM=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    elif [ -r /proc/meminfo ]; then
+        RAM=$(awk '/^MemTotal:/ { print $2 * 1024; exit }' /proc/meminfo)
+    fi
+    if [ "${RAM:-0}" -gt 0 ]; then MAXMEM=$(( RAM * 3 / 4 )); else MAXMEM=$(( STACK * 8 )); fi
+fi
+[ "$MAXMEM" -lt "$STACK" ] && MAXMEM="$STACK"   # parisizemax must be >= initial stack
 
 # Journaling is on by default: without --journal, use "<infile>.journal" so a
 # resume is tied to this input. --no-journal opts out.
@@ -129,7 +150,7 @@ if [ "$PRIMECERT" -eq 1 ]; then
     # primecertisvalid. Cert files are named by (exponent, b) so a stale cert for a
     # different M is never reused (also guarded by CC[1][1] == M).
     cat > "$SCRIPT" <<GP
-default(parisizemax, $((STACK * 8)));
+default(parisizemax, $MAXMEM);
 N = $EXP;
 cdir = "$WORK";
 v = readvec("$BASES");
@@ -165,7 +186,7 @@ for(i = 1, #v,
 GP
 else
     cat > "$SCRIPT" <<GP
-default(parisizemax, $((STACK * 8)));
+default(parisizemax, $MAXMEM);
 N = $EXP;
 v = readvec("$BASES");
 {
@@ -182,6 +203,7 @@ GP
 fi
 
 echo "Proof:       $METHOD (PARI/GP, ARM-native)"
+echo "Memory:      parisizemax $(( MAXMEM / 1024 / 1024 )) MiB (initial stack $(( STACK / 1024 / 1024 )) MiB)"
 if [ -n "$JOURNAL" ]; then
     echo "Candidates:  $NALL total, $NDONE done per journal, $NB to prove  (from $INFILE)"
     echo "Journal:     $JOURNAL"
