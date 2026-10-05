@@ -88,9 +88,10 @@ if [ $(( len % BLOCK )) -ne 0 ]; then
     exit 2
 fi
 
-# Diagnostic output of the called tools goes to fd 3/4: the terminal when -v is
-# set, otherwise /dev/null. The result files (--out) are unaffected either way.
-if [ "$VERBOSE" -eq 1 ]; then exec 3>&1 4>&2; else exec 3>/dev/null 4>/dev/null; fi
+# Diagnostic output of the called tools is tagged ([SIEVE]/[PRP]/[PROVE]) and sent
+# to fd 3: the terminal when -v is set, otherwise /dev/null. The result files
+# (--out) are unaffected either way.
+if [ "$VERBOSE" -eq 1 ]; then exec 3>&1; else exec 3>/dev/null; fi
 
 N=$(( 1 << K ))
 BASES_CSV=$(printf '%s' "$BASES" | tr ' ' ',')
@@ -189,7 +190,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
             exit 1
         fi
         ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" \
-            --out "$cand_file.tmp" >&3 2>&4
+            --out "$cand_file.tmp" 2>&1 | awk '{ print "[SIEVE]", $0; fflush() }' >&3
         mv -f "$cand_file.tmp" "$cand_file"      # atomic -> a banked file is always complete
         nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
         ./coverage.sh record "$K" "$start" "$end" sieve "plimit=$PLIMIT" "$nsieve" >/dev/null
@@ -205,12 +206,13 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
         # the (authoritative) proof. Worthwhile only for large k.
         [ -x ./build/ntt_metal ] || { echo "ERROR: --gpu needs ./build/ntt_metal (build it first)." >&2; exit 1; }
         ./build/ntt_metal --prp "$cand_file" --out "$prp_file.tmp" --bases "$BASES" \
-            --journal "$prp_file.journal" $VFLAG >&3 2>&4
+            --journal "$prp_file.journal" $VFLAG 2>&1 | awk '{ print "[PRP]", $0; fflush() }' >&3
         mv -f "$prp_file.tmp" "$prp_file"
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
         ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV,gpu-fermat" "$nprp" >/dev/null
     else
-        ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" >&3 2>&4
+        ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" 2>&1 \
+            | awk '{ print "[PRP]", $0; fflush() }' >&3
         mv -f "$prp_file.tmp" "$prp_file"
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
         ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV" "$nprp" >/dev/null
@@ -218,7 +220,8 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
 
     # --- Stage 3: proof (always; persistent journal for intra-block resume) ---
     PR=$(mktemp)
-    ./prove.sh $PROVE_FLAG --journal "$journal" "$prp_file" --out "$PR" >&3 2>&4
+    ./prove.sh $PROVE_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
+        | awk '{ print "[PROVE]", $0; fflush() }' >&3
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
     { echo "# proven primes: b with (b^$N+1)/2 prime ($METHOD), block [$start..$end]"
