@@ -115,3 +115,38 @@ clang++ -std=c++17 -O3 -ObjC++ -fobjc-arc ntt_metal.mm \
   -framework Metal -framework Foundation -o ntt_metal
 for k in 13 14 15 16 17 18; do ./ntt_metal --selftest bench --k $k --b 101 --reps 40; done
 ```
+
+---
+
+## 2026-10-05 — `ntt_metal` vs. CPU, fresh sweep (BOINC stopped)
+
+GPU NTT engine vs. one GMP core, ms per modular squaring mod (b^N+1), b=101, 60
+iters/point, Apple M2 Pro, machine otherwise idle (BOINC paused). `--selftest bench`.
+
+| k | N = 2^k | GPU ms/sq | CPU ms/sq | speedup | GPU dispatch | CPU CRT+carry |
+|---|--------:|----------:|----------:|:-------:|-------------:|--------------:|
+| 13 |   8 192 | 0.653 | 0.190 | 0.29× | — | — |
+| 14 |  16 384 | 0.842 | 0.499 | 0.59× | — | — |
+| 15 |  32 768 | 1.236 | 1.158 | 0.94× | — | — |
+| 16 |  65 536 | 2.335 | 2.738 | **1.17×** | 0.93 ms | 1.23 ms |
+| 17 | 131 072 | 3.586 | 5.742 | **1.60×** | 0.87 ms | 2.48 ms |
+| 18 | 262 144 | 6.820 | 11.796 | **1.73×** | 1.25 ms | 4.97 ms |
+
+Crossover at **k = 15/16** (k=15 is a tie, k=16 wins), rising to 1.73× at k=18 —
+a touch better than the earlier run with BOINC still winding down.
+
+**What this means per candidate** (full PRP ≈ bits(M) squarings; bits(M) ≈ N·log2 b):
+- k=16 (~436k squarings): GPU ≈ 17.0 min vs CPU ≈ 19.9 min.
+- k=18 (~1.75M squarings): GPU ≈ **3.3 h** vs CPU ≈ **5.7 h** — the GPU saves ~2.4 h
+  per candidate.
+
+**Where the time goes now.** The GPU dispatch stays nearly flat with k (0.9–1.2 ms);
+the growing cost is the CPU-side CRT + carry (O(N), 1.2→5.0 ms). So the next speed
+lever is the CPU post-processing (move CRT/carry to the GPU), more than the GPU
+transform itself — four-step tiling (stage 5b) shortens an already-small part.
+
+**Reproduce.**
+```bash
+ninja -C build ntt_metal
+for k in 13 14 15 16 17 18; do ./build/ntt_metal --selftest bench --k $k --b 101 --reps 60; done
+```
