@@ -44,11 +44,14 @@ Until then: owner's own machines only, trusted, no verification needed.
 - **CUDA port of `prp_metal`** for the Windows RTX 4060 (same Montgomery math as the
   Metal kernel; CUDA also gives real per-thread branching, avoiding the SIMD-
   divergence penalty seen with multiple bases on Metal).
-- **FFT/NTT GPU PRP for large k** (tens of thousands of digits) — one big squaring
-  spread across the GPU, à la `genefer`/`gpuOwl`; the current one-thread-per-candidate
-  kernel is only for medium sizes. Design written up in
-  [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md); the medium-k prototype's
-  loss to the CPU is measured in [`BENCHMARKS.md`](BENCHMARKS.md).
+- **FFT/NTT GPU PRP for large k — DONE (Apple Silicon / Metal).** One big squaring
+  spread across the GPU via an integer NTT; `ntt_metal` (see
+  [`docs/metal-largek-prp.md`](docs/metal-largek-prp.md)) crosses over the CPU at
+  k=16 and runs the production pipeline via `run_blocks.sh --gpu`, with
+  checkpoint/resume. Still open on this engine: the four-step tiling (stage 5b,
+  speed only) and a sound error check (Gerbicz–Li). The CUDA sibling for the RTX
+  4060 is the separate item above (design in
+  [`docs/cuda-largek-prp.md`](docs/cuda-largek-prp.md)).
 - **Checkpointable large-k proofs via `primecert`.** `isprime` is single-shot (no
   resume), which becomes painful when one proof runs for days. PARI's
   `primecert(N, 0, partial)` returns a *partial* ECPP certificate — a prefix of the
@@ -64,4 +67,6 @@ Until then: owner's own machines only, trusted, no verification needed.
 - **Nicer CLI parsing** (getopt-cpp or CLI11) for the C++ tools — evaluated, not yet
   adopted.
 - **Auto-record coverage** from the tools on successful completion, instead of a
-  manual `coverage.sh record` step.
+  manual `coverage.sh record` step. (Largely moot for the main path: `run_blocks.sh`
+  already records every stage. This only matters for running the tools standalone,
+  where they would need to be told the block's (k, bmin, bmax).)

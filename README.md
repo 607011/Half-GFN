@@ -317,6 +317,32 @@ the whole GPU (as in `genefer`/`gpuOwl`), not one thread per candidate.
 > Prototype limit: `NL ≤ 128` limbs (~4096 bit). CUDA (for NVIDIA) is a planned
 > port of the same kernel; the Montgomery math is identical.
 
+### Large-k NTT engine — `ntt_metal`
+
+The "different approach entirely" above is built: `ntt_metal` spreads **one** squaring
+across the whole GPU via an integer **NTT** (exact, no round-off), the right tool for
+k ≳ 16 (numbers of 10⁵–10⁶ digits). It is verified bit-for-bit against GMP and, on an
+Apple M2 Pro, overtakes a CPU core per modular squaring at **k = 16** (1.65× at k=18) —
+see [`docs/metal-largek-prp.md`](docs/metal-largek-prp.md) and [`BENCHMARKS.md`](BENCHMARKS.md).
+
+```bash
+ninja -C build ntt_metal                       # macOS only; needs Metal + GMP
+# production: GPU Fermat PRP over a sieve candidate file -> survivors
+./build/ntt_metal --prp candidates.txt --out prp.txt [--bases "2 3 5 ..."] [--journal F]
+```
+
+It checkpoints the powering (resume after a crash/reboot) and journals per candidate.
+In the pipeline, just add `--gpu`, which routes the PRP stage to `ntt_metal` instead of
+`prp_test` (worthwhile only for large k; Fermat PRP drops no primes, so the proof stays
+authoritative):
+
+```bash
+./run_blocks.sh --k 16 --bmin 0 --bmax 999 --block 1000 --gpu
+```
+
+Still open on this engine: four-step tiling (more speed) and a Gerbicz–Li error check.
+The CUDA sibling for NVIDIA lives on the `cuda` branch until it is built on the target.
+
 ## Retired (`___attic/`)
 
 - `___attic/run_pfgw.sh` — an earlier wrapper driving
