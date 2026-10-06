@@ -242,6 +242,31 @@ Journaling works exactly as in `prp_test` (one `<base> <0|1>` line per result).
 This matters here because a single proof can take a long time (see below). Ctrl-C
 leaves the journal consistent; re-run the same command to continue.
 
+### Alternative prover: fastECPP via CM (lower memory)
+
+`gp`'s ECPP is memory-hungry and can run a 16 GB machine out of RAM well before the
+digit count becomes theoretically infeasible. `fastecpp_prover` is a more memory-
+frugal alternative: it drives Andreas Enge's **CM** (`ecpp`, a fastECPP
+implementation), builds an ECPP certificate, and reports success only after an
+independent `ecpp-check` verifies it. CM is not in Homebrew; build it once with
+
+```bash
+./build_cm.sh      # clones + builds CM (static) into ../cm/_install, no sudo
+```
+
+which also installs its only non-standard dependency (`mpfrcx`). Afterwards
+`fastecpp_prover` autodetects `../cm/_install/bin/ecpp` (override with `--ecpp` or
+`$CM_ECPP`):
+
+```bash
+./build/fastecpp_prover --base 331 --exp 256      # proves M = (b^N+1)/2
+```
+
+It is standalone for now (not wired into `prove.sh`/`run_blocks.sh`). It still only
+reaches tens of thousands of digits — further than `gp` on the same RAM, but no
+deterministic method reaches the hundreds-of-thousands/millions range for this form;
+those stay PRP.
+
 ---
 
 ## Performance notes (honest)
