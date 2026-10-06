@@ -80,6 +80,13 @@ target_link_libraries(hgfn_sieve PRIVATE hgfn_flags Threads::Threads)
 add_executable(prp_test prp_test.cpp)
 target_link_libraries(prp_test PRIVATE hgfn_flags Threads::Threads GMP::GMP)
 
+# Stage 3 alternative prover: drives CM's fastECPP (ecpp/ecpp-check) to build
+# and independently verify a deterministic primality certificate. More memory-
+# frugal than gp's primecert. The CM `ecpp`/`ecpp-check` binaries are needed at
+# runtime only (see docs); build CM from https://gitlab.inria.fr/enge/cm.
+add_executable(fastecpp_prover fastecpp_prover.cpp)
+target_link_libraries(fastecpp_prover PRIVATE hgfn_flags GMP::GMP)
+
 # Stage 1 reference for the large-k GPU engine: CPU negacyclic-NTT squaring
 # mod (b^N+1), validated against GMP. CPU-only; see docs/cuda-largek-prp.md.
 add_executable(ntt_ref ntt_ref.cpp)
