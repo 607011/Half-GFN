@@ -66,6 +66,11 @@ EXTRA_FLAG=""; METHOD_SET=0; MAX_PROVE_DIGITS=""
 BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
 VERBOSE=0; VFLAG=""; ASSUME_YES=0; GPU=0
 
+# All CPU-heavy stages (sieve, PRP, proof) run at the lowest scheduling priority so
+# the machine stays responsive and other work (e.g. BOINC) is not starved. nice is
+# inherited by child processes, so nicing prove.sh also nices the gp/ecpp it spawns.
+NICE="nice -n 19"
+
 usage() { awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
@@ -212,7 +217,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
             echo "The sieve could strike out real primes. Lower plimit." >&2
             exit 1
         fi
-        ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" \
+        $NICE ./build/hgfn_sieve $VFLAG --k "$K" --bmin "$bmin" --bmax "$end" --plimit "$PLIMIT" \
             --out "$cand_file.tmp" 2>&1 | awk '{ print "[SIEVE]", $0; fflush() }' >&3
         mv -f "$cand_file.tmp" "$cand_file"      # atomic -> a banked file is always complete
         nsieve=$(grep -c '^[0-9]' "$cand_file" || true); nsieve=${nsieve:-0}
@@ -228,13 +233,13 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
         # filter -- it drops no primes; a few extra Fermat pseudoprimes just reach
         # the (authoritative) proof. Worthwhile only for large k.
         [ -x ./build/ntt_metal ] || { echo "ERROR: --gpu needs ./build/ntt_metal (build it first)." >&2; exit 1; }
-        ./build/ntt_metal --prp "$cand_file" --out "$prp_file.tmp" --bases "$BASES" \
+        $NICE ./build/ntt_metal --prp "$cand_file" --out "$prp_file.tmp" --bases "$BASES" \
             --journal "$prp_file.journal" $VFLAG 2>&1 | awk '{ print "[PRP]", $0; fflush() }' >&3
         mv -f "$prp_file.tmp" "$prp_file"
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
         ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV,gpu-fermat" "$nprp" >/dev/null
     else
-        ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" 2>&1 \
+        $NICE ./build/prp_test $VFLAG --bases "$BASES" "$cand_file" --out "$prp_file.tmp" 2>&1 \
             | awk '{ print "[PRP]", $0; fflush() }' >&3
         mv -f "$prp_file.tmp" "$prp_file"
         nprp=$(grep -c '^[0-9]' "$prp_file" || true); nprp=${nprp:-0}
@@ -266,7 +271,7 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
     # gracefully: keep the block as PRP (proof pending) and move on, rather than
     # aborting the whole run.
     set +e
-    ./prove.sh $pflag $EXTRA_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
+    $NICE ./prove.sh $pflag $EXTRA_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
         | awk '{ print "[PROVE]", $0; fflush() }' >&3
     prc=${PIPESTATUS[0]}
     set -e
