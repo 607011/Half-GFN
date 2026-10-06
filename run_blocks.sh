@@ -38,6 +38,10 @@
 #   --primecert    force resumable ECPP (checkpointed descent; survives a crash)
 #   --maxmem BYTES cap the prover's memory (prove.sh --maxmem); default ~3/4 of RAM,
 #                  so a large-k proof cannot swap the machine
+#   --max-prove-digits N  skip the proof above N decimal digits and keep the block as
+#                  PRP (proof pending) -- graceful degrade so a too-large proof does
+#                  not run into the RAM cap. Default: rough RAM-based ceiling
+#                  (~10000 digits on 16 GB); 0 disables the guard.
 #   -v | --verbose pass -v to hgfn_sieve/prp_test and show their output
 #   -y | --yes     recompute/overwrite already-computed blocks without asking
 #   --gpu          run the PRP stage on the GPU NTT engine (ntt_metal, Fermat PRP);
@@ -58,7 +62,7 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 BLOCK=1000000
 K=""; BMIN=""; BMAX=""; PLIMIT="1e7"; METHOD="aprcl"; PROVE_FLAG=""
-EXTRA_FLAG=""; METHOD_SET=0
+EXTRA_FLAG=""; METHOD_SET=0; MAX_PROVE_DIGITS=""
 BASES="2 3 5 7 11 13 17 19 23 29 31 37 41"
 VERBOSE=0; VFLAG=""; ASSUME_YES=0; GPU=0
 
@@ -76,6 +80,7 @@ while [ $# -gt 0 ]; do
         --ecpp)   METHOD="ecpp"; PROVE_FLAG="--ecpp"; METHOD_SET=1; shift ;;
         --primecert) METHOD="ecpp-primecert"; PROVE_FLAG="--primecert"; METHOD_SET=1; shift ;;
         --maxmem) EXTRA_FLAG="$EXTRA_FLAG --maxmem $2"; shift 2 ;;
+        --max-prove-digits) MAX_PROVE_DIGITS="$2"; shift 2 ;;
         -v|--verbose) VERBOSE=1; VFLAG="-v"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --gpu)    GPU=1; shift ;;
@@ -99,6 +104,17 @@ fi
 # to fd 3: the terminal when -v is set, otherwise /dev/null. The result files
 # (--out) are unaffected either way.
 if [ "$VERBOSE" -eq 1 ]; then exec 3>&1; else exec 3>/dev/null; fi
+
+# Graceful degrade: a proof of a number far larger than the machine can handle would
+# just run into the RAM cap and fail. Above this many decimal digits, skip the proof
+# and keep the block as PRP (proof pending). Default is a rough RAM-based ceiling
+# (~10000 digits on 16 GB); 0 disables the guard; --max-prove-digits overrides.
+if [ -z "$MAX_PROVE_DIGITS" ]; then
+    RAM=0
+    if [ "$(uname)" = "Darwin" ]; then RAM=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    elif [ -r /proc/meminfo ]; then RAM=$(awk '/^MemTotal:/ { print $2 * 1024; exit }' /proc/meminfo); fi
+    if [ "${RAM:-0}" -gt 0 ]; then MAX_PROVE_DIGITS=$(( RAM / 1600000 )); else MAX_PROVE_DIGITS=0; fi
+fi
 
 N=$(( 1 << K ))
 BASES_CSV=$(printf '%s' "$BASES" | tr ' ' ',')
@@ -225,19 +241,40 @@ for (( start=BMIN; start<=BMAX; start+=BLOCK )); do
         ./coverage.sh record "$K" "$start" "$end" prp "bases=$BASES_CSV" "$nprp" >/dev/null
     fi
 
-    # --- Stage 3: proof (always; persistent journal for intra-block resume) ---
+    # --- Stage 3: proof ---
+    pdigits=$(awk -v n="$N" -v b="$end" 'BEGIN { printf "%d", n * log(b) / log(10) }')
+
+    # Graceful degrade: if there are survivors but the number is too large to prove on
+    # this machine, skip the proof and keep the block as PRP (proof pending). The prp
+    # file and journal are kept, so a later retry (e.g. on a bigger machine, or with
+    # --max-prove-digits raised) resumes exactly here.
+    if [ "$nprp" -gt 0 ] && [ "$MAX_PROVE_DIGITS" -gt 0 ] && [ "${pdigits:-0}" -gt "$MAX_PROVE_DIGITS" ]; then
+        echo "[BLOCK] k=$K block [$start..$end]: sieve=$nsieve prp=$nprp -- ~$pdigits digits > --max-prove-digits $MAX_PROVE_DIGITS: proof skipped, kept as PRP (proof pending)"
+        continue
+    fi
+
     # Auto method unless the user forced one: large numbers (>= ~3000 digits) -> the
     # resumable ECPP (primecert), small -> APR-CL. Matches prove.sh's own auto, but
     # resolved here too so the coverage/results method label is accurate.
     pflag="$PROVE_FLAG"; pmethod="$METHOD"
     if [ "$METHOD_SET" -eq 0 ]; then
-        pdigits=$(awk -v n="$N" -v b="$end" 'BEGIN { printf "%d", n * log(b) / log(10) }')
         if [ "${pdigits:-0}" -ge 3000 ]; then pflag="--primecert"; pmethod="ecpp-primecert";
         else pflag="--aprcl"; pmethod="aprcl"; fi
     fi
     PR=$(mktemp)
+    # Attempt the proof; if it fails anyway (e.g. runs into the RAM cap), degrade
+    # gracefully: keep the block as PRP (proof pending) and move on, rather than
+    # aborting the whole run.
+    set +e
     ./prove.sh $pflag $EXTRA_FLAG --journal "$journal" "$prp_file" --out "$PR" 2>&1 \
         | awk '{ print "[PROVE]", $0; fflush() }' >&3
+    prc=${PIPESTATUS[0]}
+    set -e
+    if [ "$prc" -ne 0 ]; then
+        echo "[BLOCK] k=$K block [$start..$end]: sieve=$nsieve prp=$nprp -- proof did not complete (exit $prc; likely too large for this machine): kept as PRP (proof pending)"
+        rm -f "$PR"
+        continue
+    fi
     nprimes=$(grep -c '^[0-9]' "$PR" || true); nprimes=${nprimes:-0}
 
     { echo "# proven primes: b with (b^$N+1)/2 prime ($pmethod), block [$start..$end]"
