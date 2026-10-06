@@ -221,6 +221,7 @@ for(i = 1, #v,
 }
 GP
 fi
+echo "quit;" >> "$SCRIPT"   # ensure gp exits after the script (no interactive hang)
 
 echo "Proof:       $METHOD (PARI/GP, ARM-native)$AUTO_NOTE"
 echo "Memory:      parisizemax $(( MAXMEM / 1024 / 1024 )) MiB (initial stack $(( STACK / 1024 / 1024 )) MiB)"
@@ -248,7 +249,7 @@ if [ "$NB" -eq 0 ]; then
     echo "  (nothing to do -- all candidates already in the journal)"
 else
     set +e
-    gp -q -s "$STACK" "$SCRIPT" 2>&1 | tee "$LOG" | while IFS= read -r line; do
+    gp -q -s "$STACK" "$SCRIPT" < /dev/null 2>&1 | tee "$LOG" | while IFS= read -r line; do
         case "$line" in
             RESULT\ *)
                 set -- $line          # RESULT b r dt
