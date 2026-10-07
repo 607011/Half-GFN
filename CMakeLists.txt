@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(hgfn_sieve
     VERSION 1.0.0
     DESCRIPTION "ARM-native prime-hunting toolchain for (b^2^k+1)/2"
-    LANGUAGES CXX)
+    LANGUAGES CXX C)
 
 # ---------------------------------------------------------------------------
 # Standard / defaults
@@ -80,12 +80,55 @@ target_link_libraries(hgfn_sieve PRIVATE hgfn_flags Threads::Threads)
 add_executable(prp_test prp_test.cpp)
 target_link_libraries(prp_test PRIVATE hgfn_flags Threads::Threads GMP::GMP)
 
-# Stage 3 alternative prover: drives CM's fastECPP (ecpp/ecpp-check) to build
-# and independently verify a deterministic primality certificate. More memory-
-# frugal than gp's primecert. The CM `ecpp`/`ecpp-check` binaries are needed at
-# runtime only (see docs); build CM from https://gitlab.inria.fr/enge/cm.
-add_executable(fastecpp_prover fastecpp_prover.cpp)
-target_link_libraries(fastecpp_prover PRIVATE hgfn_flags GMP::GMP)
+# Stage 3 alternative prover: links Andreas Enge's CM (fastECPP) directly and
+# calls cm_ecpp() in-process to build AND verify a deterministic primality
+# certificate -- more memory-frugal than gp's primecert, and no subprocess.
+# CM is not in Homebrew; build it once with ./build_cm.sh (installs into
+# ../cm/_install by default). Set -DCM_ROOT=/path or $CM_ROOT to override.
+# The target is skipped (with a note) if CM is not found, so the rest of the
+# project still builds.
+set(CM_ROOT "${CMAKE_SOURCE_DIR}/../cm/_install" CACHE PATH "CM install prefix")
+if(DEFINED ENV{CM_ROOT})
+    set(CM_ROOT "$ENV{CM_ROOT}")
+endif()
+find_path(CM_INCLUDE_DIR cm.h HINTS "${CM_ROOT}/include")
+find_library(CM_LIBRARY NAMES cm HINTS "${CM_ROOT}/lib")
+
+# CM's static libcm needs PARI, mpfrcx, mpc and mpfr (plus gmp/z/m). These come
+# from Homebrew; collect their include/lib dirs via `brew --prefix`.
+find_program(BREW_EXECUTABLE brew)
+set(_cm_inc_dirs "")
+set(_cm_lib_dirs "")
+if(BREW_EXECUTABLE)
+    foreach(_f pari mpfrcx libmpc mpfr gmp)
+        execute_process(COMMAND ${BREW_EXECUTABLE} --prefix ${_f}
+            OUTPUT_VARIABLE _p OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(_p)
+            list(APPEND _cm_inc_dirs "${_p}/include")
+            list(APPEND _cm_lib_dirs "${_p}/lib")
+        endif()
+    endforeach()
+endif()
+find_library(PARI_LIBRARY   NAMES pari   HINTS ${_cm_lib_dirs})
+find_library(MPFRCX_LIBRARY NAMES mpfrcx HINTS ${_cm_lib_dirs})
+find_library(MPC_LIBRARY    NAMES mpc    HINTS ${_cm_lib_dirs})
+find_library(MPFR_LIBRARY   NAMES mpfr   HINTS ${_cm_lib_dirs})
+
+if(CM_INCLUDE_DIR AND CM_LIBRARY AND PARI_LIBRARY AND MPFRCX_LIBRARY
+        AND MPC_LIBRARY AND MPFR_LIBRARY)
+    # fastecpp_cm.c is the C shim that includes CM's (C-only) headers; the C++
+    # driver never includes them.
+    add_executable(fastecpp_prover fastecpp_prover.cpp fastecpp_cm.c)
+    target_include_directories(fastecpp_prover PRIVATE ${CM_INCLUDE_DIR} ${_cm_inc_dirs})
+    # Order matters for the static libcm.a: it must precede the libraries it
+    # depends on.
+    target_link_libraries(fastecpp_prover PRIVATE hgfn_flags
+        ${CM_LIBRARY} ${PARI_LIBRARY} ${MPFRCX_LIBRARY} ${MPC_LIBRARY}
+        ${MPFR_LIBRARY} GMP::GMP z)
+else()
+    message(STATUS "CM (fastECPP) not found -- skipping fastecpp_prover. "
+                   "Build it with ./build_cm.sh (or set -DCM_ROOT=<prefix>).")
+endif()
 
 # Stage 1 reference for the large-k GPU engine: CPU negacyclic-NTT squaring
 # mod (b^N+1), validated against GMP. CPU-only; see docs/cuda-largek-prp.md.
