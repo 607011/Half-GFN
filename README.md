@@ -186,17 +186,21 @@ This is the cheap filter — a passed PRP test is **not** a proof.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--bases "a b c"` | `3` | space-separated PRP bases |
+| `--bases "a b c"` | first 13 primes (`2..41`) | space-separated PRP bases |
+| `--gmp-prp REPS` | *(off)* | use `mpz_probab_prime_p(M, REPS)` instead of explicit bases |
 | `--exp N` | *(from header)* | override exponent |
 | `--limit N` | `0` (all) | test only the first `N` candidates |
 | `--out FILE` | `prp.txt` | output file for PRP bases |
 | `--threads N` | all cores | worker threads |
-| `--journal FILE` | *(off)* | enable journaling / resume |
+| `--journal FILE` | `<candidate-file>.journal` | journaling / resume file (`--no-journal` disables) |
 | `--verbose` | off | also report composite candidates |
 
 Use several bases: a single base has pseudoprimes. For example `(81^1024+1)/2`
 passes base 3 but is composite (base 5 catches it, and the proof stage rejects it
 outright).
+For comparison runs, `--gmp-prp REPS` switches to GMP's integrated probable-prime
+routine (trial division + BPSW + additional MR rounds); when used, `--bases` is
+ignored.
 
 ### Journaling
 
@@ -212,6 +216,24 @@ which are where the time goes.
 
 Ctrl-C stops cleanly: in-flight tests finish and are journaled, and `prp.txt` is
 written only on a complete run (until then, the journal is the source of truth).
+
+### A/B mode comparison helper
+
+Use [`compare_prp_modes.sh`](./compare_prp_modes.sh) to run the same candidate file
+through both Stage-2 modes:
+
+1. explicit strong-PRP bases (`--bases ...`)
+2. GMP integrated probable-prime routine (`--gmp-prp REPS`)
+
+Example:
+
+```bash
+./compare_prp_modes.sh --cand kand.txt --bases "2 3 5 7 11 13 17 19 23 29 31 37 41" --reps 25
+```
+
+The script writes both `prp_test` outputs, logs, and set differences
+(`in_both.txt`, `only_bases_mode.txt`, `only_gmp_mode.txt`) into
+`compare_prp_modes/` (override with `--out-dir`).
 
 ---
 
@@ -246,17 +268,22 @@ leaves the journal consistent; re-run the same command to continue.
 
 `gp`'s ECPP is memory-hungry and can run a 16 GB machine out of RAM well before the
 digit count becomes theoretically infeasible. `fastecpp_prover` is a more memory-
-frugal alternative: it drives Andreas Enge's **CM** (`ecpp`, a fastECPP
-implementation), builds an ECPP certificate, and reports success only after an
-independent `ecpp-check` verifies it. CM is not in Homebrew; build it once with
+frugal alternative: it links Andreas Enge's **CM** library (a fastECPP
+implementation) and calls `cm_ecpp()` in-process with `check=true`, so CM builds the
+ECPP certificate *and* verifies it before returning — no subprocess, and success
+means the certificate was checked, never merely assumed. CM is not in Homebrew;
+build it once with
 
 ```bash
 ./build_cm.sh      # clones + builds CM (static) into ../cm/_install, no sudo
 ```
 
-which also installs its only non-standard dependency (`mpfrcx`). Afterwards
-`fastecpp_prover` autodetects `../cm/_install/bin/ecpp` (override with `--ecpp` or
-`$CM_ECPP`):
+which also installs its only non-standard dependency (`mpfrcx`). The build produces
+`libcm.a` plus its headers; CMake then finds CM under `../cm/_install` (override with
+`-DCM_ROOT=<prefix>` or `$CM_ROOT`) and builds the `fastecpp_prover` target — if CM
+is absent the target is skipped and the rest of the project still builds. At runtime
+the prover autodetects CM's modular-polynomial data dir (`../cm/_install/share/cm`,
+override with `--modpoldir` or `$CM_MODPOLDIR`):
 
 ```bash
 ./build/fastecpp_prover --base 331 --exp 256      # proves M = (b^N+1)/2
@@ -412,6 +439,9 @@ so a completed block is unambiguous and reproducible.
 odd bases `B ≤ b ≤ C` (inclusive). `--block SIZE` sets the block size (default 1e6,
 the unit of a coverage row / resume / claim) — shrink it for large `k`. The interval
 size must be a whole multiple of `SIZE`.
+For PRP-method A/B runs inside the block pipeline, add `--compare-prp` (optional
+`--compare-prp-reps N`): each block then gets a report under
+`results/prp_compare/kK/start-end/`.
 
 `STATUS.md` is generated from the ledger — never edit it by hand. Each completion is
 a single appended line, so two machines rarely produce a merge conflict; regenerate
