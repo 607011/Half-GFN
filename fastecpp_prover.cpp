@@ -1,73 +1,60 @@
 // fastecpp_prover.cpp
 //
-// Drives Andreas Enge's CM "ecpp" program (a fastECPP implementation) to
-// produce a *deterministic* primality proof of M = (b^N + 1) / 2, and then
-// verifies the resulting certificate independently with CM's "ecpp-check".
+// Deterministic primality proof of M = (b^N + 1) / 2 via Andreas Enge's CM
+// library (a fastECPP implementation), linked directly -- no subprocess.
 //
-// Design notes:
-//   * Input is assumed to be already PRP-filtered (Miller-Rabin). By default
-//     we still let ecpp run its own cheap initial test so an accidental
-//     composite is rejected fast instead of sending the ECPP downrun into a
-//     long spin. Pass --trust (ecpp "-t") to skip that pre-test when the
-//     caller is certain; it only saves one Miller-Rabin and never weakens or
-//     strengthens the resulting proof.
-//   * A proof is reported ONLY when the independent ecpp-check confirms a
-//     valid certificate. We never treat a bare exit code as "proved".
-//   * CM writes its certificate (CM format + a .primo twin) plus checkpoint
-//     and scratch files into CM_ECPP_TMPDIR. We point that at a work dir so
-//     a proof can be interrupted and resumed.
+// We call cm_ecpp() with check=true, so CM builds an ECPP certificate AND
+// verifies it in-process (cm_pari_ecpp_check); the function's return value is
+// the verification result. A proof is reported only when that check passes --
+// we never trust an unverified certificate.
 //
-// Build: see the "fastecpp_prover" target in the Makefile (needs GMP).
+// Composite handling: with trust=false CM aborts the whole process via exit(1)
+// on a composite input. To keep this usable as a library front-end we instead
+// pre-screen with a strong probable-prime test ourselves and only hand CM a
+// number that already looks prime (trust=true). Input is expected to be PRP-
+// filtered upstream anyway; this just makes an accidental composite a clean
+// rejection instead of a hard exit.
+//
+// Build: the "fastecpp_prover" CMake target (needs libcm + PARI/mpfrcx/mpc/
+// mpfr/gmp). Build CM once with ./build_cm.sh. The actual CM call lives in the
+// C shim fastecpp_cm.c (CM's headers are not C++-safe).
 
 #include <gmp.h>
 
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <vector>
+
+// Defined in fastecpp_cm.c (C linkage): run CM's fastECPP on N and verify.
+extern "C" int fe_cm_ecpp_prove(mpz_srcptr N, const char* modpoldir,
+                                char* tmpdir, int verbose);
 
 static void usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s --exp N --base B [options]\n"
         "   or: %s --in FILE   (FILE holds one decimal integer M)\n"
         "\n"
-        "Proves M = (b^N + 1) / 2 prime via CM's fastECPP, then verifies the\n"
-        "certificate with ecpp-check. Input must already be PRP-filtered.\n"
+        "Proves M = (b^N + 1) / 2 prime via CM's fastECPP (linked), and\n"
+        "verifies the certificate in-process. Input must be PRP-filtered.\n"
         "\n"
         "Options:\n"
-        "  --ecpp PATH        path to CM 'ecpp' binary (default: autodetect)\n"
-        "  --ecpp-check PATH  path to CM 'ecpp-check' (default: next to ecpp)\n"
-        "  --workdir DIR      scratch/checkpoint dir (CM_ECPP_TMPDIR)\n"
-        "  --cert PATH        keep the certificate at PATH (default: workdir)\n"
-        "  --keep-cert        do not delete the certificate on success\n"
-        "  --trust            skip ecpp's initial pre-test (input is prime)\n"
-        "  -v, --verbose      pass -v to ecpp\n",
+        "  --modpoldir DIR    CM modular-polynomial data dir (default: autodetect\n"
+        "                     ../cm/_install/share/cm, or $CM_MODPOLDIR)\n"
+        "  --workdir DIR      scratch/checkpoint dir for resumable proofs\n"
+        "  --mr-rounds K      pre-screen Miller-Rabin rounds (default 25)\n"
+        "  --trust            skip the pre-screen (input is known prime)\n"
+        "  -v, --verbose      verbose CM output\n",
         prog, prog);
     std::exit(2);
 }
 
-static bool file_exists(const std::string& p) {
+static bool dir_exists(const std::string& p) {
     struct stat st;
-    return stat(p.c_str(), &st) == 0;
-}
-
-// Shell-quote a single argument for use inside std::system().
-static std::string shq(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') {
-            out += "'\\''";
-        } else {
-            out += c;
-        }
-    }
-    out += "'";
-    return out;
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void compute_M(mpz_t out, unsigned long base, unsigned long exp) {
@@ -79,51 +66,36 @@ static void compute_M(mpz_t out, unsigned long base, unsigned long exp) {
     mpz_clear(tmp);
 }
 
-// Try to locate the CM ecpp binary relative to common build locations.
-static std::string autodetect_ecpp() {
-    if (const char* env = std::getenv("CM_ECPP")) {
+// CM needs the directory holding its modular-polynomial data (df/af/mf). It is
+// compiled into the ecpp binary, but when we link the library we must supply it.
+static std::string autodetect_modpoldir() {
+    if (const char* env = std::getenv("CM_MODPOLDIR")) {
         if (env[0] != '\0') {
             return env;
         }
     }
-    // Prefer an installed, self-contained build (correct CM_MODPOLDIR, static
-    // libcm) over the in-tree libtool wrapper.
-    const std::array<const char*, 6> candidates = {
-        "cm/_install/bin/ecpp",
-        "../cm/_install/bin/ecpp",
-        "cm/src/ecpp",
-        "../cm/src/ecpp",
-        "./ecpp",
-        "/usr/local/bin/ecpp",
+    const std::array<const char*, 3> candidates = {
+        "cm/_install/share/cm",
+        "../cm/_install/share/cm",
+        "/usr/local/share/cm",
     };
     for (const char* c : candidates) {
-        if (file_exists(c)) {
+        if (dir_exists(c)) {
             return c;
         }
     }
-    return "ecpp";  // last resort: rely on PATH
-}
-
-// Derive the ecpp-check path from the ecpp path (same directory).
-static std::string sibling_check(const std::string& ecpp) {
-    std::size_t slash = ecpp.find_last_of('/');
-    if (slash == std::string::npos) {
-        return "ecpp-check";
-    }
-    return ecpp.substr(0, slash + 1) + "ecpp-check";
+    return "/usr/local/share/cm";  // CM's own default; may still work for tiny inputs
 }
 
 int main(int argc, char** argv) {
     unsigned long exp = 0;
     unsigned long base = 0;
     std::string in_file;
-    std::string ecpp;
-    std::string ecpp_check;
+    std::string modpoldir;
     std::string workdir;
-    std::string cert;
-    bool keep_cert = false;
-    bool verbose = false;
+    int mr_rounds = 25;
     bool trust = false;
+    bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -136,20 +108,15 @@ int main(int argc, char** argv) {
         } else if (a == "--in") {
             if (i + 1 >= argc) { usage(argv[0]); }
             in_file = argv[++i];
-        } else if (a == "--ecpp") {
+        } else if (a == "--modpoldir") {
             if (i + 1 >= argc) { usage(argv[0]); }
-            ecpp = argv[++i];
-        } else if (a == "--ecpp-check") {
-            if (i + 1 >= argc) { usage(argv[0]); }
-            ecpp_check = argv[++i];
+            modpoldir = argv[++i];
         } else if (a == "--workdir") {
             if (i + 1 >= argc) { usage(argv[0]); }
             workdir = argv[++i];
-        } else if (a == "--cert") {
+        } else if (a == "--mr-rounds") {
             if (i + 1 >= argc) { usage(argv[0]); }
-            cert = argv[++i];
-        } else if (a == "--keep-cert") {
-            keep_cert = true;
+            mr_rounds = std::atoi(argv[++i]);
         } else if (a == "--trust") {
             trust = true;
         } else if (a == "-v" || a == "--verbose") {
@@ -175,7 +142,7 @@ int main(int argc, char** argv) {
         std::string s;
         f >> s;
         if (mpz_set_str(M, s.c_str(), 10) != 0) {
-            std::fprintf(stderr, "file does not contain a decimal integer: %s\n", in_file.c_str());
+            std::fprintf(stderr, "file does not hold a decimal integer: %s\n", in_file.c_str());
             mpz_clear(M);
             return 2;
         }
@@ -186,108 +153,51 @@ int main(int argc, char** argv) {
         usage(argv[0]);
     }
 
-    if (ecpp.empty()) {
-        ecpp = autodetect_ecpp();
-    }
-    if (ecpp_check.empty()) {
-        ecpp_check = sibling_check(ecpp);
-    }
-
-    // Scratch / checkpoint directory. CM writes the certificate, its .primo
-    // twin, and (large) intermediate factor/class-polynomial files here.
-    if (workdir.empty()) {
-        const char* env = std::getenv("CM_ECPP_TMPDIR");
-        if (env && env[0] != '\0') {
-            workdir = env;
-        } else {
-            workdir = "fastecpp_work";
-        }
-    }
-    mkdir(workdir.c_str(), 0755);  // ignore EEXIST
-
-    if (cert.empty()) {
-        std::ostringstream c;
-        c << workdir << "/cert";
-        if (base != 0) {
-            c << "_" << base << "_" << exp;
-        }
-        c << ".out";
-        cert = c.str();
-    }
-
     const std::size_t digits = mpz_sizeinbase(M, 10);
-    std::fprintf(stderr, "[FASTECPP] M has %zu decimal digits; ecpp=%s\n",
-                 digits, ecpp.c_str());
 
-    // Write M to a file so we never build a multi-hundred-kB argv string.
-    const std::string nfile = workdir + "/N.txt";
-    {
-        std::ofstream nf(nfile, std::ios::trunc);
-        if (!nf) {
-            std::fprintf(stderr, "cannot write %s\n", nfile.c_str());
+    // Pre-screen so a composite is rejected cleanly instead of CM's exit(1).
+    if (!trust) {
+        if (mpz_probab_prime_p(M, mr_rounds) == 0) {
+            std::fprintf(stderr, "[FASTECPP] %zu-digit M is composite -- not proved\n", digits);
             mpz_clear(M);
-            return 2;
+            return 1;
         }
-        char* s = mpz_get_str(nullptr, 10, M);
-        nf << s << "\n";
-        std::free(s);
     }
+
+    if (modpoldir.empty()) {
+        modpoldir = autodetect_modpoldir();
+    }
+    if (!dir_exists(modpoldir)) {
+        std::fprintf(stderr,
+            "[FASTECPP] warning: modpoldir '%s' not found; large proofs will fail.\n"
+            "           Build CM (./build_cm.sh) or pass --modpoldir.\n",
+            modpoldir.c_str()); // TODO: why not write to std::cerr?
+    }
+
+    // Optional scratch/checkpoint dir: CM stores discriminant-independent
+    // precomputations and polynomial-factoring checkpoints here, which makes a
+    // long proof resumable. NULL tmpdir simply disables that.
+    char* tmpdir = nullptr;
+    std::string tmpbuf;
+    if (!workdir.empty()) {
+        mkdir(workdir.c_str(), 0755);  // ignore EEXIST
+        tmpbuf = workdir;
+        tmpdir = tmpbuf.data();
+    }
+
+    std::fprintf(stderr, "[FASTECPP] proving %zu-digit M (modpoldir=%s)...\n",
+                 digits, modpoldir.c_str());
+
+    // The shim runs cm_ecpp with check=true, so success means the certificate
+    // was built AND verified in-process (we pre-screened, so trust=true there).
+    const bool proved = fe_cm_ecpp_prove(M, modpoldir.c_str(), tmpdir,
+                                         verbose ? 1 : 0) != 0;
     mpz_clear(M);
 
-    // Phase 1: prove.  -t trusts (skip pre-test; we are PRP-filtered),
-    //                  -c self-checks, -f writes the certificate.
-    // CM reads the number from -n; we feed it from the file via a safe
-    // expansion so the shell -- not our process -- builds the argument.
-    std::ostringstream prove;
-    prove << "CM_ECPP_TMPDIR=" << shq(workdir) << " "
-          << shq(ecpp) << " -c"
-          << (trust ? " -t" : "")
-          << (verbose ? " -v" : "")
-          << " -f " << shq(cert)
-          << " -n \"$(cat " << shq(nfile) << ")\"";
-    std::fprintf(stderr, "[FASTECPP] proving...\n");
-    int rc = std::system(prove.str().c_str());
-    if (rc != 0) {
-        std::fprintf(stderr, "[FASTECPP] ecpp exited non-zero (rc=%d)\n", rc);
-        return 1;
-    }
-    if (!file_exists(cert)) {
-        std::fprintf(stderr, "[FASTECPP] no certificate produced at %s\n", cert.c_str());
-        return 1;
-    }
-
-    // Phase 2: independent verification. Only "valid ECPP certificate in the
-    // CM format" (ecpp-check res==1) counts as a proof.
-    std::ostringstream check;
-    check << shq(ecpp_check) << " -f " << shq(cert);
-    std::fprintf(stderr, "[FASTECPP] verifying certificate...\n");
-    FILE* pipe = popen(check.str().c_str(), "r");
-    if (!pipe) {
-        std::fprintf(stderr, "[FASTECPP] cannot run ecpp-check\n");
-        return 1;
-    }
-    std::string out;
-    std::array<char, 4096> buf;
-    std::size_t n;
-    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) {
-        out.append(buf.data(), n);
-    }
-    int crc = pclose(pipe);
-    std::fputs(out.c_str(), stderr);
-
-    const bool valid =
-        crc == 0 &&
-        out.find("valid ECPP certificate in the CM format") != std::string::npos;
-    if (!valid) {
+    if (!proved) {
         std::fprintf(stderr, "[FASTECPP] certificate did NOT verify -- not proved\n");
         return 1;
     }
-
-    if (!keep_cert) {
-        std::remove(cert.c_str());
-        std::remove((cert + ".primo").c_str());
-    }
-    std::remove(nfile.c_str());
 
     if (base != 0) {
         std::printf("PROVED base=%lu exp=%lu digits=%zu\n", base, exp, digits);
