@@ -1,0 +1,463 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Partitional primes: definition, provability, finiteness heuristic ---
+% Compile with:  pdflatex PARTITIONAL.tex   (twice, for cross-references)
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage{microtype}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=blue]{hyperref}
+
+% The partitional operator: a left turnstile, like the one Oliver Lau chose (⊢).
+\newcommand{\partop}{\vdash}
+\newcommand{\Part}{\Pi}                 % the partitorial product
+\newcommand{\jacobi}[2]{\left(\frac{#1}{#2}\right)}
+
+\title{\textbf{Partitional Primes}\\[0.3em]
+       \large Definition, provability, and a finiteness heuristic}
+\author{Oliver Lau}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+A number class invented by Oliver Lau, together with the heuristic argument that
+it almost certainly contains only \textbf{finitely many} primes. This note
+records the definition, why these primes are cheap to prove, and the
+probabilistic budget that predicts their scarcity --- so it does not get lost.
+
+\section{Definition}
+
+With $p(k)$ the integer \textbf{partition function}
+\[
+  p(0)=1,\; p(1)=1,\; p(2)=2,\; p(3)=3,\; p(4)=5,\; p(5)=7,\; p(6)=11,\;\dots
+\]
+define the \emph{partitorial}
+\[
+  \Part(n) \;=\; \prod_{k=0}^{n} p(k) \;=\; p(0)\cdot p(1)\cdot p(2)\cdots p(n),
+\]
+and the \textbf{Partitional numbers} (operator $\partop$, ASCII fallback \texttt{\S}):
+\[
+  n\partop \;=\; \Part(n) \pm 1 .
+\]
+
+\paragraph{Example ($n=10$).}
+\[
+  \Part(10)=1\cdot1\cdot2\cdot3\cdot5\cdot7\cdot11\cdot15\cdot22\cdot30\cdot42
+          = 960\,498\,000,
+\]
+so the two candidates are $960\,498\,001$ and $960\,497\,999$.
+
+\subsection*{How fast does \texorpdfstring{$\Part(n)$}{Pi(n)} grow?}
+
+$\Part(n)$ grows \emph{much} faster than the factorial. The cleanest way to see
+this is not to look at the number itself --- it quickly has thousands of digits
+--- but at its \textbf{logarithm}. A handy fact: the number of decimal digits of
+a whole number $X$ is about $\ln X / \ln 10 \approx \ln X / 2.303$. So ``how big
+is $\Part(n)$'' really means ``how big is $\ln\Part(n)$,'' and that is the
+quantity we track.
+
+\paragraph{Step 1 --- turn the product into a sum.}
+The logarithm turns multiplication into addition, which is exactly what we want
+for a product:
+\[
+  \ln\Part(n) \;=\; \ln\!\prod_{k=0}^{n} p(k)
+             \;=\; \sum_{k=0}^{n} \ln p(k).
+\]
+So the size of $\Part(n)$ is just the running total of the sizes of the
+individual partition numbers $p(k)$.
+
+\paragraph{Step 2 --- how big is a single partition number?}
+Here we borrow one famous result, the \emph{Hardy--Ramanujan formula} (1918): the
+partition numbers themselves already grow almost exponentially, and their
+logarithm behaves like
+\[
+  \ln p(k) \;\sim\; \pi\sqrt{\tfrac{2}{3}\,k} \;\approx\; 2.565\,\sqrt{k}.
+\]
+In words: each partition number is roughly ``$e$ to the power of (a constant
+times $\sqrt{k}$).'' This is the only outside ingredient we need --- everything
+else is bookkeeping.
+
+\paragraph{Step 3 --- add them all up.}
+Summing Step 2 over $k=0,\dots,n$ means adding up $\sqrt{0}+\sqrt{1}+\dots+\sqrt{n}$.
+A sum of $\sqrt{k}$ is well approximated by the area under the curve $\sqrt{x}$,
+i.e.\ its integral:
+\[
+  \sum_{k\le n}\sqrt{k} \;\approx\; \int_{0}^{n}\!\sqrt{x}\,\mathrm{d}x
+                       \;=\; \tfrac{2}{3}\,n^{3/2}.
+\]
+Putting Steps 2 and 3 together (the constant is
+$\pi\sqrt{2/3}\cdot\tfrac23 \approx 2.565\cdot0.667 \approx 1.71$):
+\[
+  \boxed{\;\ln \Part(n)\;\sim\; 1.71\,\cdot n^{3/2}\;}
+\]
+
+\paragraph{What this means in plain terms.}
+The exponent is $n^{3/2}=n\sqrt{n}$, i.e.\ ``$n$ times the square root of $n$.''
+That one square-root factor is what makes Partitional numbers explode faster than
+factorials: for the factorial, $\ln(n!)\sim n\ln n$ grows only like ``$n$ times
+the (slow) logarithm of $n$,'' whereas here it grows like ``$n$ times the (much
+larger) $\sqrt{n}$.'' Concretely, $\ln\Part(n)\approx 1.71\,n^{3/2}$ translates
+via Step~1's digit rule ($\text{digits}\approx\ln\Part(n)/2.303$) into
+\[
+  \text{digits of }\Part(n)\;\approx\; 0.74\,\cdot n^{3/2}.
+\]
+Check it: at $n=316$ this predicts $0.74\cdot316^{3/2}\approx 4160$ --- the right
+ballpark for the actual $3255$ digits (the formula is an asymptotic, a bit
+generous at ``small'' $n$). At $n=1000$ it is already about $20\,000$ digits, and
+at $n=10\,000$ roughly $740\,000$. This breakneck growth is precisely why
+Partitional primes thin out so fast --- see the finiteness heuristic in
+Section~\ref{sec:heuristic}.
+
+\section{Why these primes are cheap to prove}
+
+\paragraph{Two kinds of ``is it prime?''}
+There is a fast, cheap test (a \emph{primality test}) that says ``this number is
+almost certainly prime'' --- good enough to go hunting with, but not a proof. And
+there is the harder job of a watertight \textbf{proof} that a number really is
+prime, with no ``almost.'' For a number with thousands of digits, how expensive
+that proof is depends entirely on \emph{what we know about the number's
+neighbours}, $N-1$ and $N+1$.
+
+\paragraph{The expensive route: ECPP.}
+For a ``random'' large prime --- one with no special structure --- the only
+general proof method is \textbf{ECPP} (Elliptic Curve Primality Proving). It
+works, but it is slow and hungry for memory: proving a few-thousand-digit number
+can take hours and gigabytes of RAM. This is the wall the rest of this project
+keeps running into.
+
+\paragraph{The cheap route: knowing the factors of a neighbour.}
+There is a classical shortcut, more than a century old. \emph{If} you already
+know the complete prime factorization of $N-1$ \emph{or} of $N+1$, then you can
+\textbf{prove} $N$ prime quickly and with almost no memory. The catch is normally
+the ``if'': factoring a big number is itself hopeless.
+
+\paragraph{Why factoring $\Part(n)$ costs us nothing.}
+The ``if'' is normally the whole problem --- but for Partitional numbers it is
+free, and the reason is a small, almost childish observation: \textbf{the prime
+factorization of a \emph{product} is just the factorizations of its pieces,
+thrown together.} And $\Part(n)$ \emph{is} a product --- one we assembled
+ourselves out of the small partition numbers $p(0),\dots,p(n)$. We never set a
+factoring algorithm loose on the giant $\Part(n)$; we factor each little $p(k)$
+(they have only a handful of digits) and collect. For $n=10$:
+\[
+  \Part(10)=2\cdot3\cdot5\cdot7\cdot11\cdot
+            \underbrace{15}_{3\cdot5}\cdot
+            \underbrace{22}_{2\cdot11}\cdot
+            \underbrace{30}_{2\cdot3\cdot5}\cdot
+            \underbrace{42}_{2\cdot3\cdot7}
+          \;=\; 2^{4}\cdot3^{4}\cdot5^{3}\cdot7^{2}\cdot11^{2}
+          \;=\; 960\,498\,000 .
+\]
+We have just read off the complete factorization of $960\,498\,000$ without ever
+treating that nine-digit number as a monolith. The identical thing happens at
+$n=316$: the product has $3255$ digits, yet its factorization is handed to us for
+free, because every building block is tiny.
+
+\paragraph{The trick, run in reverse.}
+It is worth savouring how backwards this is. Normally you are handed a number $N$
+and get stuck, because \emph{its} neighbours $N-1$ and $N+1$ both refuse to
+factor. Here we go the other way round: we \emph{start} from a number we have
+already factored completely --- $\Part(n)$, by construction --- and ask which
+nearby numbers it now lets us certify. We are not picking a target and then
+hunting for its factors; we are picking targets \emph{because} their factored
+neighbour is already in hand. And a fully factored $\Part(n)$ has exactly two
+immediate neighbours to offer: $\Part(n)+1$ and $\Part(n)-1$.
+
+\paragraph{Two candidates, two directions.}
+Because $\Part(n)$ sits right between those two candidates, the one free
+factorization serves both of them --- once on each side. Take the first variant,
+$N=\Part(n)+1$: its \emph{lower} neighbour is $N-1=\Part(n)$, precisely the
+number we hold in factored form, and knowing the factors of $N-1$ is exactly what
+the classical \textbf{$N-1$ test} wants (Pocklington's theorem, descended from
+Lucas and later sharpened into the Brillhart--Lehmer--Selfridge, or ``BLS'',
+form). The second variant, $N=\Part(n)-1$, tilts the same fact the other way: now
+the factored number is the \emph{upper} neighbour, $N+1=\Part(n)$, which is the
+input for the mirror-image \textbf{$N+1$ test} (built on Lucas sequences, likewise
+in a BLS form). So the single pre-factored number $\Part(n)$ plays the part of
+``$N-1$'' for one candidate and ``$N+1$'' for the other: two sides of the same
+coin, and between them they cover both Partitional variants.
+
+\subsection*{The idea behind the two tests, without formulae}
+
+Both tests rest on one picture: a prime $N$ forces a certain \emph{cycle} to have
+an exact length, and you could only have built a cycle of that length if $N$
+really is prime. Checking the length precisely is where the factors come in.
+
+\paragraph{The $N-1$ test.}
+Picture a clock face whose positions are the numbers $1,2,\dots,N-1$. Pick a
+starting value $a$ and ``tick'' by repeatedly multiplying by $a$, always wrapping
+around (that is, keeping the remainder after dividing by $N$). Sooner or later
+the hand lands back on its start; the number of ticks that takes is its
+\emph{period}. A classical fact (Fermat's little theorem) says that when $N$ is
+prime, some choice of $a$ runs with the \emph{full} period $N-1$ --- the hand
+tours every position before returning home. Turn that around and it becomes a
+proof: if you can \emph{exhibit} an $a$ whose period is exactly $N-1$, then the
+clock truly has $N-1$ distinct positions, and that happens only when $N$ is
+prime. The delicate part is confirming the period is the \emph{whole} $N-1$ and
+not some shorter fraction of it --- and that is where you need the prime factors
+of $N-1$: for each prime $q$ dividing $N-1$, you check that the hand is \emph{not}
+yet home after only $(N-1)/q$ ticks. No factors of $N-1$, no check. A
+pre-factored $N-1$ is the golden ticket.
+
+\paragraph{The $N+1$ test.}
+When it is $N+1$ you can factor instead, you play the very same game on a
+\emph{larger} clock. To build it you widen the number system a little: roughly,
+you admit one new ``imaginary'' quantity --- a square root that simply does not
+exist among the ordinary remainders --- much as the complex numbers are made by
+bolting $\sqrt{-1}$ onto the reals. In that enlarged world a prime $N$ conjures up
+a clock of size $N+1$, and the role of ``keep multiplying by $a$'' is taken over
+by a Fibonacci-like recipe (technically a \emph{Lucas sequence}: each term is a
+fixed blend of the two before it). The rest is identical: exhibit such a sequence
+whose period is the full $N+1$, confirm it does not collapse early at $(N+1)/q$
+for each prime $q$ dividing $N+1$, and $N$ stands proven. Same idea, mirror side
+--- and this time it is the factors of $N+1$ that you must know.
+
+\paragraph{Why this is so cheap.}
+Each check above is one ``run the hand to a certain number of ticks'' --- in
+arithmetic terms, one modular exponentiation --- per prime factor of $\Part(n)$.
+That is fast, and it uses only $O(N)$ memory (storage proportional to the
+number's own length, nothing worse). It scales far beyond what ECPP can reach: we
+proved $\Part(316)-1$ ($3255$ digits) deterministically in ${\sim}9$~minutes on a
+laptop via the $N+1$ method, where plain ECPP on the same number would take hours
+and heavy RAM.
+
+\paragraph{The same trick in the wild.}
+Partitional numbers are not the only ``product $\pm1$'' family, and the others are
+hunted in earnest. The factorial primes $n!\pm1$, the primorial primes $p\#\pm1$,
+and --- since 2025 --- the compositorial primes $n!/n\#\pm1$ (here $n\#$ is the
+primorial, so $n!/n\#$ is the product of all \emph{composite} numbers up to $n$)
+are all searched by the volunteer project \textbf{PrimeGrid}. Every record they
+report is a genuine, fully \emph{proven} prime of hundreds of thousands of digits
+--- not a mere probable prime --- and the reason is exactly the mechanism above:
+each of these forms carries its own pre-factored neighbour, so the $N\pm1$ proof
+stays cheap at sizes where ECPP would be hopeless. Partitional numbers share that
+machinery precisely; what sets them apart is only their faster growth
+(Section~\ref{sec:heuristic}), which alone pushes them onto the rare ``finitely
+many'' side.
+
+\medskip
+\noindent\emph{(Fine print: for very large $n$ a few of the $p(k)$ themselves
+become big and might not factor quickly. The BLS method still works as long as
+the part we \emph{did} factor covers more than the cube root of $N$ --- which in
+practice holds comfortably --- with ECPP needed only on whatever small leftover
+remains. This has not been necessary in the range explored so far.)}
+
+\section{Why there are probably only finitely many}\label{sec:heuristic}
+
+This is not a proof (none is possible --- see Section~\ref{sec:proof}). It is a
+back-of-the-envelope argument that nonetheless pins the answer down surprisingly
+well.
+
+\paragraph{Step 1 --- how likely is one candidate to be prime?}
+A deep but standard result (the \emph{prime number theorem}) says: among numbers
+near a large value $X$, roughly one in every $\ln X$ is prime. So if you hand me
+a number of size $X$ and I know nothing special about it, my best guess is that
+it is prime with probability about $1/\ln X$. For our candidate $\Part(n)\pm1$,
+that size is $X=\Part(n)$, so
+\[
+  \Pr[\,\Part(n)\pm1 \text{ prime}\,] \;\approx\; \frac{C}{\ln\Part(n)} .
+\]
+The fudge factor $C$ just bundles two real effects: we get two shots at each $n$
+(the $+1$ and the $-1$), and these candidates are known to have \emph{no small
+factors} (they were built that way), which makes them a bit likelier to be prime
+than a truly random number. We will pin $C$ down from the data in a moment.
+
+\paragraph{Step 2 --- add up the chances over all $n$.}
+The expected \emph{total} number of Partitional primes is just the sum of those
+per-$n$ chances. And now the growth rate from Section~1 does all the work.
+Because $\ln\Part(n)\approx 1.71\,n^{3/2}$, each term shrinks like $1/n^{3/2}$:
+\[
+  E_{\text{total}}
+  \;=\; \sum_{n\ge2}\Pr[\,\Part(n)\pm1\text{ prime}\,]
+  \;\approx\; C\cdot\sum_{n\ge2}\frac{2}{\ln\Part(n)}
+  \;\propto\; \sum_{n\ge2}\frac{1}{n^{3/2}}.
+\]
+
+\paragraph{Step 3 --- does that sum add up to something finite?}
+This is the crux, and it is a schoolbook distinction. An infinite sum of
+ever-smaller terms can either pile up without limit (\emph{diverges}) or settle
+on a finite total (\emph{converges}). The textbook dividing line is the exponent
+on $n$: $\sum 1/n^{1}$ diverges (grows forever), while $\sum 1/n^{s}$ for any
+exponent $s>1$ converges. Our exponent is $s=\tfrac32 > 1$, so
+\[
+  \sum_{n\ge2}\frac{1}{n^{3/2}} \;\;\text{\textbf{converges}} \;\;\Longrightarrow\;\;
+  E_{\text{total}} \text{ is \textbf{finite}.}
+\]
+In plain words: the candidates grow so explosively (that $\sqrt{n}$ in the
+exponent again) that the chance of being prime drops away fast enough for the
+grand total of expected primes to be a finite number --- not infinity.
+
+\paragraph{Step 4 --- put a number on it.}
+We can fix $C$ by matching the prediction to reality. Up to $n=316$ we have found
+$19$ primes, and the corresponding sum works out to
+$2\sum_{n\le316}1/\ln\Part(n)=6.89$. Setting $C\cdot 6.89 = 19$ gives
+$C\approx2.76$. Carrying that same $C$ out to \emph{all} $n$ (the tail of the sum
+adds very little) gives the \textbf{total lifetime budget}:
+\[
+  E_{\text{total}}
+  \;\approx\; 2.76\cdot 2\!\sum_{n\ge2}\frac{1}{\ln\Part(n)}
+  \;\approx\; 2.76\cdot 7.05
+  \;\approx\; \boxed{19.5\text{ primes --- over \emph{all} } n.}
+\]
+
+We have already found $19$. \textbf{The budget is essentially spent.} The table
+below splits the remaining ${\sim}0.5$ of a prime across ranges of $n$ (``bands'').
+$E$ is the expected number of hits in that band; $P(\ge1)=1-e^{-E}$ converts that
+into the probability of finding \emph{at least one} (if hits land at random with
+average count $E$, the chance of drawing a blank is $e^{-E}$, so the chance of
+one or more is $1-e^{-E}$):
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Band} & \textbf{expected $E$} & \textbf{$P(\ge1)$}\\
+\midrule
+$(316,\;920]$      & $0.18$ & ${\sim}17\%$\\
+$(920,\;1000]$     & $0.01$ & ${\sim}1\%$\\
+$(1000,\;2000]$    & $0.07$ & ${\sim}7\%$\\
+$(2000,\;4000]$    & $0.05$ & ${\sim}5\%$\\
+$(4000,\;40000]$   & $0.07$ & ${\sim}7\%$\\
+\midrule
+\rowcolor{gray!15}
+\textbf{beyond 920, over all $n$, forever} & $\mathbf{\approx 0.23}$ & $\mathbf{{\sim}21\%}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+So the expected number of Partitional primes \emph{beyond} the ones we already
+have is well under one: \textbf{most likely there are no more, at any $n$ ---
+ever.} Two honest caveats. First, $C$ was fitted from only $19$ data points at
+small $n$, so read the individual percentages as rough orders of magnitude, not
+precise odds. Second --- and this is the robust part --- the headline conclusion
+(expected count much less than $1$ from here on) rides only on the growth rate
+$\ln\Part(n)\sim n^{3/2}$, not on the exact value of $C$. Even if $C$ were off by
+a factor of two, the answer would still be ``probably none left.''
+
+\subsection*{Where this sits among ``generator'' primes}
+
+It helps to compare Partitional numbers with the other classic recipes that build
+candidates from a growing product or formula. The single thing that decides
+``finitely many vs.\ infinitely many'' is whether the sum from Step~3 converges
+--- which in turn is decided by how fast the numbers grow:
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Family} & \textbf{size $\ln(\text{value})$ grows like} & \textbf{the sum $\sum 1/\ln$} & \textbf{expectation}\\
+\midrule
+Primorial $p\#\pm1$          & $n\ln n$   & diverges & infinitely many\\
+Factorial $n!\pm1$           & $n\ln n$   & diverges & infinitely many\\
+Compositorial $n!/n\#\pm1$   & $n\ln n$   & diverges & infinitely many\\
+\rowcolor{gray!15}
+\textbf{Partitional $\Part(n)\pm1$} & $\mathbf{n^{3/2}}$ & \textbf{converges} & \textbf{finitely many}\\
+Fermat $2^{2^k}+1$           & $2^k$      & converges (fast) & finitely many\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The primorial ($p\#$, the product of all primes up to $p$), the factorial, and
+the compositorial ($n!/n\#$, the product of all \emph{composite} numbers up to
+$n$) all grow only moderately, their sums never settle, and all three are
+expected to yield infinitely many primes. The Fermat numbers grow so savagely (a
+tower of powers of $2$) that their sum converges almost instantly --- and indeed
+only $5$ Fermat primes are known, with most experts expecting no more.
+Partitional numbers land on the same ``finite'' side as Fermat, just with a more
+generous budget (${\sim}19$ expected, versus the $5$ Fermat primes). That is the
+company this new class keeps --- and, among the product-based families, it is the
+lone outlier on the finite side.
+
+\section{Can it be proven or disproven?}\label{sec:proof}
+
+Short answer: \textbf{no --- not with today's mathematics}, in either direction.
+The heuristic above tells us what to \emph{expect}; it does not settle anything.
+This is the same frustrating situation as with the Fermat primes, where ``are
+there finitely many?'' has been open for centuries.
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{We cannot prove there are finitely many.} To do that, you would
+  need to show that from some point on, \emph{every} $\Part(n)\pm1$ is composite
+  (non-prime). But there is no mechanism forcing that. The usual way a formula
+  gets ``poisoned'' into always being composite is a fixed small divisor --- and
+  these candidates are immune to exactly that. Here is why: the moment some prime
+  $q$ shows up as a factor of one partition number $p(k)$, it is a factor of the
+  whole product $\Part(n)$ for every $n\ge k$. So $\Part(n)$ is a multiple of
+  $q$, which means $\Part(n)\pm1$ is \emph{one away} from a multiple of $q$ and
+  therefore \emph{never} divisible by $q$. In other words the candidates are, by
+  construction, coprime to (share no factor with) every prime that lives inside
+  $\Part(n)$ --- they are designed to slip past all the small divisors. Ruling
+  out primality forever would mean proving that an incredibly thin set of numbers
+  eventually contains none at all, and no technique can do that.
+\item \textbf{We cannot prove there are infinitely many either.} That is hard
+  even for the ``easy'' families whose sums diverge (primorial, factorial), where
+  everyone believes the primes go on forever but nobody can prove it. For a
+  convergent family like ours it is only more hopeless.
+\end{itemize}
+
+\noindent
+The one escape hatch that would turn this into a real theorem is an
+\emph{algebraic} surprise: if $\Part(n)\pm1$ secretly always factored by a formula
+--- the way $n^4+4$ always splits as $(n^2-2n+2)(n^2+2n+2)$ and so is composite
+for every $n>1$ --- then finiteness (in fact, ``almost none'') would follow
+instantly. Nothing hints at such a hidden factorization, and the coprimality
+argument above makes a \emph{simple} one unlikely. But that identity, if it
+existed, is the only known route to an actual proof.
+
+\section{Known Partitional primes ($n\le320$, all proven)}
+
+\begin{center}
+\begin{tabular}{@{}rccc@{}}
+\toprule
+$n$ & variant & digits & method\\
+\midrule
+2   & $\Part(n)+1$ & 1    & $N-1$\\
+3   & $\Part(n)+1$ & 1    & $N-1$\\
+3   & $\Part(n)-1$ & 1    & $N+1$\\
+4   & $\Part(n)+1$ & 2    & $N-1$\\
+4   & $\Part(n)-1$ & 2    & $N+1$\\
+5   & $\Part(n)+1$ & 3    & $N-1$\\
+6   & $\Part(n)+1$ & 4    & $N-1$\\
+6   & $\Part(n)-1$ & 4    & $N+1$\\
+7   & $\Part(n)+1$ & 5    & $N-1$\\
+7   & $\Part(n)-1$ & 5    & $N+1$\\
+10  & $\Part(n)+1$ & 9    & $N-1$\\
+13  & $\Part(n)+1$ & 15   & $N-1$\\
+14  & $\Part(n)-1$ & 17   & $N+1$\\
+18  & $\Part(n)+1$ & 27   & $N-1$\\
+22  & $\Part(n)+1$ & 38   & $N-1$\\
+67  & $\Part(n)+1$ & 258  & $N-1$\\
+198 & $\Part(n)-1$ & 1535 & $N+1$\\
+217 & $\Part(n)-1$ & 1780 & $N+1$\\
+316 & $\Part(n)-1$ & 3255 & $N+1$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+$19$ primes total ($11$ of form $\Part(n)+1$, $8$ of form $\Part(n)-1$). No
+Partitional prime of either variant exists for $68\le n\le320$ except
+$n=198,217,316$ --- consistent with the heuristic's thinning tail.
+
+\section{Tools in this repo}
+
+\begin{itemize}[leftmargin=1.4em]
+\item \texttt{partitional.gp} --- explorer: \texttt{scan(nmax)} (table),
+  \texttt{prove(n)} (both variants, deterministic, with timing),
+  \texttt{report(nmax)} (list primes). The $N-1$ and $N+1$ BLS provers are
+  validated against PARI's \texttt{isprime} for $n\le50$.
+\item \texttt{hunt\_partitional.sh} --- resumable, \texttt{nice}-d PRP search
+  over a range, appending hits to \texttt{results/partitional\_prp.log}; prove
+  hits later with \texttt{gp -q partitional.gp} $\to$ \texttt{prove(n)}.
+\end{itemize}
+
+\end{document}
